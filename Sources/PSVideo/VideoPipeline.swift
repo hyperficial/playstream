@@ -42,6 +42,33 @@ public final class VideoPipeline: VideoStreamSink {
 		set { pacingLock.withLock { pacing.maxMs = max(0, newValue); pacing.minMs = min(pacing.minMs, pacing.maxMs) } }
 	}
 
+	/// Upscaling of the picture to the display's pixel size. Main thread, takes effect on the next frame.
+	/// Default `.off`. Only the `.metal` display path has a scaling stage: with `.sampleBufferLayer` the
+	/// setting is remembered but inactive (`stats.activeUpscaler == .off`); switch `displayMode` to
+	/// `.metal` to use it.
+	public var upscaler: VideoUpscaler {
+		get { upscalerSetting }
+		set {
+			dispatchPrecondition(condition: .onQueue(.main))
+			upscalerSetting = newValue
+			rendererLock.withLock { renderer }.setUpscaler(newValue)
+		}
+	}
+	private var upscalerSetting: VideoUpscaler = .off
+
+	/// Frame generation (main thread). Default `.off`. Needs `displayMode == .metal` and
+	/// `pacingMode == .adaptive`; otherwise it is remembered but inactive (see `stats.frameGenerationState`).
+	public var frameGeneration: VideoFrameGeneration {
+		get { frameGenerationSetting }
+		set {
+			dispatchPrecondition(condition: .onQueue(.main))
+			frameGenerationSetting = newValue
+			rendererLock.withLock { renderer }.setFrameGeneration(newValue)
+		}
+	}
+	private var frameGenerationSetting: VideoFrameGeneration = .off
+	private var contentPixelSize: CGSize = .zero
+
 	/// Live statistics; cheap value copy, safe from any thread.
 	public var stats: VideoStats { collector.snapshot() }
 
@@ -73,6 +100,8 @@ public final class VideoPipeline: VideoStreamSink {
 	private var activity: NSObjectProtocol?
 
 	private let pacer = FramePacer()
+	private let debugSubmit = ProcessInfo.processInfo.environment["PSVIDEO_DEBUG_FG"] != nil
+	private var lastCallEnd: UInt64 = 0
 	private var lastPacerPublish: UInt64 = 0
 	private var lateFrames = 0
 	private var skippedFrames = 0
@@ -150,7 +179,14 @@ public final class VideoPipeline: VideoStreamSink {
 
 	public func videoStreamDidReceive(accessUnit: UnsafeRawBufferPointer, framesLost: Int, frameRecovered: Bool) -> Bool {
 		let arrival = mach_absolute_time()
-		return streamLock.withLock { process(accessUnit, framesLost: framesLost, frameRecovered: frameRecovered, arrival: arrival) }
+		let r = streamLock.withLock { process(accessUnit, framesLost: framesLost, frameRecovered: frameRecovered, arrival: arrival) }
+		if debugSubmit {
+			let inside = StatsCollector.ms(from: arrival, to: mach_absolute_time())
+			let gap = lastCallEnd == 0 ? 0 : StatsCollector.ms(from: lastCallEnd, to: arrival)
+			if inside > 3 || gap > 30 { NSLog("[PSVideo] receive: %.1f ms inside, %.1f ms since previous call returned", inside, gap) }
+			lastCallEnd = mach_absolute_time()
+		}
+		return r
 	}
 
 	public func videoStreamDidStop() {
@@ -225,11 +261,12 @@ public final class VideoPipeline: VideoStreamSink {
 		pacer.minDelay = settings.minMs / 1000
 		pacer.maxDelay = settings.maxMs / 1000
 		var schedule = pacer.schedule(arrival: hostSeconds(arrival), framesLost: framesLost)
+		schedule.discontinuity = framesLost > 0 || frameRecovered
 		if settings.mode == .adaptive {
 			if schedule.late { lateFrames += 1 }
 			if schedule.skip { skippedFrames += 1 }
 		} else {
-			schedule = FrameSchedule(target: nil, skip: false, late: false, interval: schedule.interval)
+			schedule = FrameSchedule(target: nil, skip: false, late: false, interval: schedule.interval, discontinuity: schedule.discontinuity)
 		}
 		scheduleObserver?(hostSeconds(arrival), schedule.target ?? .nan, schedule.skip)
 		publishPacing(settings.mode, now: arrival)
@@ -241,7 +278,13 @@ public final class VideoPipeline: VideoStreamSink {
 			return reject(dropped: true)
 		}
 
-		switch r.submit(sample, isKeyframe: keyframe, arrival: arrival, schedule: schedule) {
+		let submitStart = mach_absolute_time()
+		let result = r.submit(sample, isKeyframe: keyframe, arrival: arrival, schedule: schedule)
+		if debugSubmit {
+			let ms = StatsCollector.ms(from: submitStart, to: mach_absolute_time())
+			if ms > 2 { NSLog("[PSVideo] submit blocked the stream thread %.1f ms", ms) }
+		}
+		switch result {
 		case .accepted:
 			consecutiveRejects = 0
 			return true
@@ -293,7 +336,10 @@ public final class VideoPipeline: VideoStreamSink {
 	private func reject(dropped: Bool) -> Bool {
 		collector.update { s in
 			s.framesRejected += 1
-			if dropped { s.framesDropped += 1 }
+			if dropped {
+				s.framesDropped += 1
+				s.dropsAwaitingKeyframe += 1
+			}
 		}
 		return false
 	}
@@ -343,6 +389,10 @@ public final class VideoPipeline: VideoStreamSink {
 		guard current.mode != mode else { return }
 		let new = Self.makeRenderer(mode, stats: collector)
 		new.setPacing(pacingMode)
+		new.setUpscaler(upscalerSetting)
+		new.setFrameGeneration(frameGenerationSetting)
+		new.setOutputPixelSize(contentPixelSize)
+		if let o = outputOverride, let m = new as? MetalVideoRenderer { m.setOutputOverride(o) }
 		new.presentedObserver = current.presentedObserver
 		let config: (codec: VideoCodec, color: VideoColorInfo, fd: CMVideoFormatDescription)? = rendererLock.withLock {
 			renderer = new
@@ -368,6 +418,70 @@ public final class VideoPipeline: VideoStreamSink {
 			let d = CMVideoFormatDescriptionGetDimensions(fd)
 			view.setVideoSize(CGSize(width: Int(d.width), height: Int(d.height)))
 		}
+	}
+
+	/// The view laid out the video rect: its size in pixels (main thread).
+	func contentPixelSizeChanged(_ size: CGSize) {
+		contentPixelSize = size
+		rendererLock.withLock { renderer }.setOutputPixelSize(size)
+	}
+
+	private var outputOverride: CGSize?
+
+	/// Diagnostics: render as if the on-screen video rect were `size` pixels (headless testing).
+	@_spi(Diagnostics)
+	public func setOutputPixelSizeOverride(_ size: CGSize?) {
+		outputOverride = size
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.setOutputOverride(size)
+	}
+
+	/// Diagnostics: the last decoded picture through the Metal path's conversion + `upscaler` at
+	/// `outputSize`, rendered offscreen (rgba16Float, stream transfer domain), plus GPU time.
+	@_spi(Diagnostics)
+	public func renderLastFrameOffscreen(upscaler: VideoUpscaler, outputSize: CGSize?, hdrDomainLinear: Bool? = nil, readBack: Bool = true)
+		-> (width: Int, height: Int, rgba: [Float16], gpuMs: Double, mode: VideoUpscaler)?
+	{
+		guard let r = rendererLock.withLock({ renderer }) as? MetalVideoRenderer,
+		      let pb = r.copyLastPixelBuffer() else { return nil }
+		let c = colorInfo
+		return r.renderOffscreen(pb, matrix: c?.matrix ?? (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String), hdr: c?.isHDR ?? false,
+		                         upscaler: upscaler, outputSize: outputSize,
+		                         hdrDomain: hdrDomainLinear.map { $0 ? .linear : .pq }, readBack: readBack)
+	}
+
+	/// Diagnostics: interpolate the midpoint of two decoded pictures (frame generation's interpolator,
+	/// including its 8-bit conversion). Returns the picture and the interpolation time in ms.
+	@_spi(Diagnostics)
+	public func interpolateOffscreen(prev: CVPixelBuffer, next: CVPixelBuffer) -> (CVPixelBuffer, Double)? {
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.interpolateNow(prev: prev, next: next)
+	}
+
+	/// Diagnostics: frame generation's picture analysis (changed-pixel fraction, luma histogram).
+	@_spi(Diagnostics)
+	public func analyzeOffscreen(_ pb: CVPixelBuffer, previous: CVPixelBuffer?) -> (changed: Float, hist: [Float])? {
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.analyzeNow(pb, previous: previous)
+	}
+
+	/// Diagnostics: any decoded picture through the Metal conversion (+ upscaler) offscreen.
+	@_spi(Diagnostics)
+	public func renderOffscreen(pixelBuffer pb: CVPixelBuffer, upscaler: VideoUpscaler = .off, outputSize: CGSize? = nil) -> (width: Int, height: Int, rgba: [Float16])? {
+		guard let r = rendererLock.withLock({ renderer }) as? MetalVideoRenderer,
+		      let o = r.renderOffscreen(pb, matrix: colorInfo?.matrix ?? (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String), hdr: colorInfo?.isHDR ?? false, upscaler: upscaler, outputSize: outputSize)
+		else { return nil }
+		return (o.width, o.height, o.rgba)
+	}
+
+	/// Diagnostics: each decoded picture (decoder thread), Metal path.
+	@_spi(Diagnostics)
+	public func setDecodedFrameObserver(_ f: ((CVPixelBuffer) -> Void)?) {
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.decodedFrameObserver = f
+	}
+
+	/// Diagnostics: each picture frame generation hands to the display queue: kind (0 real, 1 generated,
+	/// 2 fallback repeat), target time (host s), decode-order index of the slot.
+	@_spi(Diagnostics)
+	public func setDisplayObserver(_ f: ((Int, Double, Int) -> Void)?) {
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.displayObserver = f.map { cb in { k, t, i in cb(k == .real ? 0 : k == .generated ? 1 : 2, t, i) } }
 	}
 
 	func screenChanged(_ screen: NSScreen?) {
@@ -406,8 +520,9 @@ extension VideoPipeline {
 	@_spi(Diagnostics)
 	public func renderLastFrameOffscreen() -> (width: Int, height: Int, rgba: [Float16])? {
 		guard let r = rendererLock.withLock({ renderer }) as? MetalVideoRenderer,
-		      let pb = r.copyLastPixelBuffer() else { return nil }
-		let matrix = colorInfo?.matrix ?? (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String)
-		return r.renderOffscreen(pb, matrix: matrix)
+		      let pb = r.copyLastPixelBuffer(),
+		      let o = r.renderOffscreen(pb, matrix: colorInfo?.matrix ?? (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String), hdr: colorInfo?.isHDR ?? false)
+		else { return nil }
+		return (o.width, o.height, o.rgba)
 	}
 }

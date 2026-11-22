@@ -35,6 +35,19 @@ struct SettingsView: View {
 				Text("Shows frames on a steady rhythm, about one frame later, instead of the instant they arrive. Turn off for the lowest possible delay. Applies immediately.")
 					.font(.caption)
 					.foregroundStyle(.secondary)
+				Picker("Upscaling", selection: settings.$upscaler) {
+					Text("Off").tag(0)
+					Text("Bicubic (neutral)").tag(1)
+					Text("MetalFX (sharpest)").tag(2)
+				}
+				Picker("Frame generation", selection: settings.$frameGeneration) {
+					Text("Off").tag(0)
+					Text("30 fps games to 60").tag(1)
+					Text("60 to 120 (experimental)").tag(2)
+				}
+				Text("Both apply immediately and switch to the Metal renderer. Frame generation adds about 30 ms of delay while it is filling in frames and none when the game already runs at 60.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
 				Toggle("Low-latency renderer", isOn: settings.$lowLatencyRenderer)
 				Toggle("Start in full screen", isOn: settings.$startFullscreen)
 			}

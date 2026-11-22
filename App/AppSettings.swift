@@ -34,6 +34,10 @@ final class AppSettings: ObservableObject {
 	@AppStorage("controller.rumbleStrength") var rumbleStrength: Double = 1.0
 	@AppStorage("controller.motion") var motionSensors: Bool = true
 	@AppStorage("controller.keyboard") var keyboardFallback: Bool = true
+	/// 0 off, 1 bicubic, 2 MetalFX. Needs the Metal renderer; applies live.
+	@AppStorage("stream.upscaler") var upscaler: Int = 0
+	/// 0 off, 1 fill 30 fps games up to 60, 2 double to 120 (experimental). Needs the Metal renderer and pacing; applies live.
+	@AppStorage("stream.frameGeneration") var frameGeneration: Int = 0
 	/// Experimental start-bitrate hint: 0 off, 1 variant A, 2 variant B. Applies to the next connection.
 	@AppStorage("stream.startBitrateHint") var startBitrateHint: Int = 0
 	@AppStorage("stream.showStats") var showStats: Bool = false

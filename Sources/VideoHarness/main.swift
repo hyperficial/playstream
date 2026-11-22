@@ -58,6 +58,14 @@ struct Options {
 	var sendFPS: Double?
 	var seed: UInt64 = 1
 	var switchPacingAt: Double?
+	var makeMediaDir: String?
+	var qualityRef: String?
+	var upscaler: VideoUpscaler = .off
+	var outputSize: CGSize?
+	var frameGen: VideoFrameGeneration = .off
+	var detectTruth: String?
+	var fgEval = false
+	var genTruth: String?
 }
 
 var opt = Options()
@@ -107,6 +115,16 @@ while !args.isEmpty {
 	case "--send-fps": opt.sendFPS = Double(next())
 	case "--seed": opt.seed = UInt64(next()) ?? 1
 	case "--switch-pacing-at": opt.switchPacingAt = Double(next())
+	case "--make-media": opt.makeMediaDir = next()
+	case "--quality": opt.qualityRef = next()
+	case "--upscaler": opt.upscaler = VideoUpscaler(rawValue: next()) ?? .off
+	case "--frame-gen": opt.frameGen = VideoFrameGeneration(rawValue: next()) ?? .off
+	case "--detect-eval": opt.detectTruth = next()
+	case "--fg-eval": opt.fgEval = true
+	case "--gen-truth": opt.genTruth = next()
+	case "--output-size":
+		let p = next().split(separator: "x").compactMap { Double($0) }
+		if p.count == 2 { opt.outputSize = CGSize(width: p[0], height: p[1]) }
 	default:
 		print("unknown option \(a)")
 		exit(2)
@@ -120,6 +138,10 @@ func log(_ s: String) {
 }
 
 let startTime = CACurrentMediaTime()
+
+if let dir = opt.makeMediaDir {
+	exit(makeMedia(dir: dir) ? 0 : 1)
+}
 
 // MARK: - Elementary stream splitting (independent of the module's own parser)
 
@@ -271,6 +293,20 @@ app.setActivationPolicy(opt.window ? .accessory : .prohibited)
 let pipeline = VideoPipeline(displayMode: opt.mode, pacingMode: opt.pacing)
 if let v = opt.minDelayMs { pipeline.minimumPlayoutDelayMs = v }
 if let v = opt.maxDelayMs { pipeline.maximumPlayoutDelayMs = v }
+pipeline.upscaler = opt.upscaler
+pipeline.frameGeneration = opt.frameGen
+let detectEval = opt.detectTruth.map { DetectEval(truthPath: $0) }
+let interpEval = opt.fgEval ? InterpEval(dumpDir: opt.dumpDir) : nil
+if let d = opt.dumpDir { try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true) }
+if detectEval != nil || interpEval != nil {
+	pipeline.setDecodedFrameObserver { pb in
+		detectEval?.frame(pb)
+		interpEval?.frame(pb)
+	}
+}
+let displayLog = DisplayLog()
+pipeline.setDisplayObserver { k, t, i in displayLog.add(k, t, i) }
+if let o = opt.outputSize { pipeline.setOutputPixelSizeOverride(o) }
 let console = SimulatedConsole()
 let tap = TapCounter()
 pipeline.keyframeRequester = console
@@ -404,7 +440,26 @@ let result = FeedResult()
 var streamStartHost = 0.0
 let resultLock = NSLock()
 
+/// The real network thread is woken by socket I/O; a timer-driven harness thread gets coalesced
+/// wake-ups on a busy system (60-110 ms late seen). Make the feeder a time-constraint thread so the
+/// arrival pattern is what the test asks for.
+func makeFeederRealtime() {
+	var tb = mach_timebase_info_data_t()
+	mach_timebase_info(&tb)
+	func ticks(_ ms: Double) -> UInt32 { UInt32(ms * 1_000_000 * Double(tb.denom) / Double(tb.numer)) }
+	var policy = thread_time_constraint_policy_data_t(period: ticks(1000.0 / 60), computation: ticks(2), constraint: ticks(5), preemptible: 1)
+	let count = mach_msg_type_number_t(MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size)
+	let r = withUnsafeMutablePointer(to: &policy) {
+		$0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+			thread_policy_set(pthread_mach_thread_np(pthread_self()), thread_policy_flavor_t(THREAD_TIME_CONSTRAINT_POLICY), $0, count)
+		}
+	}
+	if r != KERN_SUCCESS { log("feeder: could not set time-constraint policy (\(r))") }
+}
+let harnessActivity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical], reason: "ps-video-harness timing")
+
 let feeder = Thread {
+	makeFeederRealtime()
 	let padding = 64
 	var scratch = [UInt8](repeating: 0, count: 4 << 20)
 	func deliver(_ bytes: [UInt8], lost: Int, extraZeros: Int = 0) -> Bool {
@@ -533,7 +588,16 @@ func describePacing(_ s: VideoStats) -> String {
 	if let g = s.glassAvgMs { t += String(format: " glass=%.1fms", g) }
 	if let a = s.presentedIntervalAvgMs, let m = s.presentedIntervalMaxMs { t += String(format: " shown-interval=%.1f/max %.1fms offCadence=%d", a, m, s.presentedOffCadence) }
 	if let hz = s.displayRefreshHz { t += String(format: " refresh=%.0fHz", hz) }
+	t += " upscaler=\(s.upscaler.rawValue)->\(s.activeUpscaler.rawValue) \(s.upscaleInputWidth)x\(s.upscaleInputHeight)->\(s.upscaleOutputWidth)x\(s.upscaleOutputHeight)"
+	if let g = s.renderGPUTimeAvgMs, let m = s.renderGPUTimeMaxMs { t += String(format: " gpu=%.2f/%.2fms", g, m) }
+	if let g = s.scalerGPUTimeAvgMs { t += String(format: " mfx=%.2fms", g) }
+	if s.frameGeneration != .off {
+		t += String(format: " fg=%@/%@ content=%.0ffps gen=%.0f/s total=%d fallbacks=%d cuts=%d hold=%.1fms interp=%.1fms", s.frameGeneration.rawValue, s.frameGenerationState, s.contentFPS, s.generatedFPS, s.framesGenerated, s.frameGenerationFallbacks, s.frameGenerationCutsSkipped, s.frameGenerationAddedLatencyMs, s.frameGenerationTimeMs)
+	}
 	t += String(format: " lead=%.1fms", s.presentationLeadMs)
+	t += " drops[kf=\(s.dropsAwaitingKeyframe) dec=\(s.dropsDecodeError) sup=\(s.dropsSuperseded) ovf=\(s.dropsQueueOverflow) nodrw=\(s.dropsNoDrawable)]"
+	t += String(format: " qmax=%d drwwait=%.1fms", s.pacedQueueDepthMax, s.drawableWaitMaxMs)
+	if let c = s.commitAheadMinMs { t += String(format: " commitAheadMin=%.1fms", c) }
 	if let d = s.layerFrameDelayMs { t += String(format: " layerFrameDelay=%.2fms", d) }
 	return t
 }
@@ -766,12 +830,23 @@ if let pb = pipeline.copyLastDecodedPixelBuffer() {
 if let c = pipeline.colorInfo {
 	log("format description colour: primaries=\(c.primaries) transfer=\(c.transferFunction) matrix=\(c.matrix) fullRange=\(c.fullRange) bitDepth=\(c.bitDepth) taggedInStream=\(c.taggedInStream)")
 }
-if let dir = opt.dumpDir, let pb = pipeline.copyLastDecodedPixelBuffer() {
+if let q = opt.qualityRef {
+	if let d = opt.dumpDir { try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true) }
+	evaluateUpscaling(refPath: q, dumpDir: opt.dumpDir)
+} else if let dir = opt.dumpDir, let pb = pipeline.copyLastDecodedPixelBuffer() {
 	try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
 	verifyAndDump(pb, dir: dir)
 }
 summarizePresentation()
 summarizeSchedule()
+detectEval?.report()
+interpEval?.report()
+if opt.frameGen != .off {
+	let truth = opt.genTruth.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }?.split(separator: "\n").map { $0 == "1" } ?? []
+	let n = Int(opt.seconds * Double(opt.fps))
+	log("frame generation (display queue, planned on the vsync grid):")
+	summarizeGeneration(displayLog, truth: truth, phases: [("first half", 30, n / 2), ("second half", n / 2, n + 1)])
+}
 log("PACING " + describePacing(final))
 pipeline.videoStreamDidStop()
 log("FINAL \(describe(final))")

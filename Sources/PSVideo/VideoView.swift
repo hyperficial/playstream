@@ -21,6 +21,7 @@ public final class VideoView: NSView {
 		layer = rootLayer
 		wantsLayer = true
 		layerContentsRedrawPolicy = .never
+		rootLayer.onContentPixelSize = { [weak pipeline] size in pipeline?.contentPixelSizeChanged(size) }
 		pipeline.attach(self)
 	}
 
@@ -60,6 +61,7 @@ public final class VideoView: NSView {
 		let scale = window?.backingScaleFactor ?? 2
 		rootLayer.contentsScale = scale
 		rootLayer.content?.contentsScale = scale
+		rootLayer.setNeedsLayout()
 	}
 
 	@objc private func refreshTick(_ link: CADisplayLink) {}
@@ -84,6 +86,9 @@ public final class VideoView: NSView {
 /// Root layer: keeps the content layer aspect-fit inside its bounds.
 final class VideoRootLayer: CALayer {
 	private(set) var content: CALayer?
+	/// Pixel size of the video rect after layout (drives the Metal path's upscaler).
+	var onContentPixelSize: ((CGSize) -> Void)?
+	private var lastPixelSize = CGSize.zero
 	var videoSize: CGSize = .zero {
 		didSet { if videoSize != oldValue { setNeedsLayout() } }
 	}
@@ -114,6 +119,11 @@ final class VideoRootLayer: CALayer {
 			content.frame = AVMakeRect(aspectRatio: videoSize, insideRect: bounds).integral
 		}
 		CATransaction.commit()
+		let px = CGSize(width: (content.frame.width * contentsScale).rounded(), height: (content.frame.height * contentsScale).rounded())
+		if px != lastPixelSize {
+			lastPixelSize = px
+			onContentPixelSize?(px)
+		}
 	}
 
 	override func action(forKey event: String) -> CAAction? { nil }

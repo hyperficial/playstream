@@ -54,7 +54,10 @@ final class StreamController: ObservableObject {
 		self.input = input
 		self.consoleName = configuration.host.nickname
 		self.session = StreamSession(configuration: configuration)
-		self.video = VideoPipeline(displayMode: settings.lowLatencyRenderer ? .metal : .sampleBufferLayer, pacingMode: settings.framePacing ? .adaptive : .off)
+		let wanted = Self.videoConfiguration(for: settings)
+		self.video = VideoPipeline(displayMode: wanted.display, pacingMode: wanted.pacing)
+		self.video.upscaler = wanted.upscaler
+		self.video.frameGeneration = wanted.frameGeneration
 		// Adaptive jitter buffer: 40 ms on a clean link, growing by itself when the link stalls.
 		self.audio = AudioPipeline(configuration: AudioPipelineConfiguration())
 	}
@@ -103,13 +106,38 @@ final class StreamController: ObservableObject {
 		session.stop()
 	}
 
+	/// What the video pipeline should be doing for the current settings. Upscaling and frame
+	/// generation only exist on the Metal path, and frame generation also needs pacing, so
+	/// turning either on implies those.
+	static func videoConfiguration(for settings: AppSettings) -> (display: VideoDisplayMode, pacing: VideoPacingMode, upscaler: VideoUpscaler, frameGeneration: VideoFrameGeneration) {
+		let upscaler: VideoUpscaler = [.off, .bicubic, .metalFXSpatial][min(max(settings.upscaler, 0), 2)]
+		let frameGeneration: VideoFrameGeneration = [.off, .to60, .to120][min(max(settings.frameGeneration, 0), 2)]
+		let needsMetal = settings.lowLatencyRenderer || upscaler != .off || frameGeneration != .off
+		let pacing: VideoPacingMode = (settings.framePacing || frameGeneration != .off) ? .adaptive : .off
+		return (needsMetal ? .metal : .sampleBufferLayer, pacing, upscaler, frameGeneration)
+	}
+
 	/// Settings that can change in the middle of a session.
 	func applyLiveSettings() {
-		let pacing: VideoPacingMode = settings.framePacing ? .adaptive : .off
-		if video.pacingMode != pacing {
-			video.pacingMode = pacing
-			CoreLog.note("Frame pacing: \(pacing.rawValue)")
+		let wanted = Self.videoConfiguration(for: settings)
+		var changes: [String] = []
+		if video.displayMode != wanted.display {
+			video.displayMode = wanted.display
+			changes.append("renderer \(wanted.display.rawValue)")
 		}
+		if video.pacingMode != wanted.pacing {
+			video.pacingMode = wanted.pacing
+			changes.append("pacing \(wanted.pacing.rawValue)")
+		}
+		if video.upscaler != wanted.upscaler {
+			video.upscaler = wanted.upscaler
+			changes.append("upscaler \(wanted.upscaler.rawValue)")
+		}
+		if video.frameGeneration != wanted.frameGeneration {
+			video.frameGeneration = wanted.frameGeneration
+			changes.append("frame generation \(wanted.frameGeneration.rawValue)")
+		}
+		if !changes.isEmpty { CoreLog.note("Video settings changed: " + changes.joined(separator: ", ")) }
 	}
 
 	func submitPIN(_ pin: String) {
@@ -152,6 +180,18 @@ final class StreamController: ObservableObject {
 		let v = stats.video
 		let audioText = stats.audio.map { String(format: "audio buf %.0f ms target %.0f ms gap max %.0f ms underruns %d", $0.bufferedMs, $0.targetMs, $0.longestGapMs, $0.underruns) } ?? "audio -"
 		let layerDelay = v.layerFrameDelayMs.map { String(format: "%.1f", $0) } ?? "-"
+		func ms(_ value: Double?) -> String { value.map { String(format: "%.1f", $0) } ?? "-" }
+		if v.displayMode == .metal {
+			// Second line: what actually happened at the display, the only on-screen evidence we get.
+			CoreLog.note(
+				"Present: drops kf \(v.dropsAwaitingKeyframe) dec \(v.dropsDecodeError) superseded \(v.dropsSuperseded) overflow \(v.dropsQueueOverflow) nodrawable \(v.dropsNoDrawable)"
+					+ " | ontime \(v.presentsOnTime) late1 \(v.presentsLate1) late2+ \(v.presentsLate2Plus) notshown \(v.presentsNotShown) err \(ms(v.presentErrorAvgMs))/\(ms(v.presentErrorMaxMs)) ms commitahead \(ms(v.commitAheadMinMs)) ms"
+					+ " | refreshes \(v.presentedRefreshHistogram) offcadence \(v.presentedOffCadence) panel \(ms(v.displayRefreshHz)) Hz"
+					+ " | queue \(v.pacedQueueDepthMax) drawablewait \(ms(v.drawableWaitMaxMs)) ms glass \(ms(v.glassAvgMs)) ms"
+					+ " | upscaler \(v.activeUpscaler.rawValue) \(v.upscaleOutputWidth)x\(v.upscaleOutputHeight) gpu \(ms(v.renderGPUTimeAvgMs))/\(ms(v.renderGPUTimeMaxMs)) ms scaler \(ms(v.scalerGPUTimeAvgMs)) ms"
+					+ " | framegen \(v.frameGeneration.rawValue) state \(v.frameGenerationState) content \(String(format: "%.0f", v.contentFPS)) fps generated \(String(format: "%.0f", v.generatedFPS))/s total \(v.framesGenerated) fallbacks \(v.frameGenerationFallbacks) cuts \(v.frameGenerationCutsSkipped) hold \(ms(v.frameGenerationAddedLatencyMs)) ms time \(ms(v.frameGenerationTimeMs)) ms"
+			)
+		}
 		CoreLog.note(String(
 			format: "Stats: %.0f fps %dx%d %@ | %.1f Mbit/s loss %.2f%% rtt %.1f ms | frames rx %d decoded %d dropped %d netlost %d recovered %d rejected %d layerdrop %d | arrival jitter p95 %.1f ms max gap %.0f ms | pacing %@ delay %.1f/%.1f ms lead %.1f ms late %d skipped %d layerdelay %@ ms | %@",
 			v.decodedFPS, v.width, v.height, v.hdrActive ? "HDR" : "SDR",

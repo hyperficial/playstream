@@ -44,6 +44,12 @@ protocol VideoRenderer: AnyObject {
 	func submit(_ sample: CMSampleBuffer, isKeyframe: Bool, arrival: UInt64, schedule: FrameSchedule) -> SubmitResult
 	/// Pacing switched on/off (main thread).
 	func setPacing(_ mode: VideoPacingMode)
+	/// Frame generation choice (main thread). Only the Metal path with pacing can honour it.
+	func setFrameGeneration(_ mode: VideoFrameGeneration)
+	/// Upscaler choice (main thread). Only the Metal path can honour it.
+	func setUpscaler(_ upscaler: VideoUpscaler)
+	/// Pixel size of the aspect-fit video rect on screen (main thread).
+	func setOutputPixelSize(_ size: CGSize)
 	/// Diagnostics: each frame that reached the glass (host seconds), with its arrival time. Metal paced path only.
 	var presentedObserver: ((_ presentedTime: Double, _ arrival: Double) -> Void)? { get set }
 	/// Stream ended or restarting: drop decoder state and the shown image.

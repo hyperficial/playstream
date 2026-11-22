@@ -10,6 +10,8 @@ struct FrameSchedule {
 	var late = false
 	/// Stream frame interval the grid runs at, seconds.
 	var interval = 1.0 / 60
+	/// Frames were lost / repaired just before this one (frame generation must not bridge it).
+	var discontinuity = false
 	static let immediate = FrameSchedule(target: nil, skip: false)
 }
 

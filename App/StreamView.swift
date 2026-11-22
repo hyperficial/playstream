@@ -207,6 +207,12 @@ private struct StatsOverlay: View {
 			row("Bitrate", String(format: "%.1f Mbit/s (asked %.0f)", stats.session.measuredBitrate / 1_000_000, Double(profile.bitrateKbps) / 1000))
 			row("Network", String(format: "loss %.1f%%  rtt %.0f ms", stats.session.packetLoss * 100, stats.session.rttMilliseconds))
 			row("Frames", "lost \(stats.video.framesLostInNetwork)  dropped \(stats.video.framesDropped)  recovered \(stats.video.framesRecovered)")
+			if stats.video.activeUpscaler != .off {
+				row("Upscale", "\(stats.video.activeUpscaler.rawValue) to \(stats.video.upscaleOutputWidth)×\(stats.video.upscaleOutputHeight)")
+			}
+			if stats.video.frameGeneration != .off {
+				row("Frame gen", String(format: "%@  game %.0f fps  +%.0f/s  hold %.0f ms", stats.video.frameGenerationState, stats.video.contentFPS, stats.video.generatedFPS, stats.video.frameGenerationAddedLatencyMs))
+			}
 			if let decode = stats.video.decodeTimeAvgMs {
 				row("Decode", String(format: "%.1f ms", decode))
 			}

@@ -97,6 +97,23 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 		}
 	}
 
+	/// The layer decodes and scales internally; there is no place for a scaling stage on this path.
+	func setUpscaler(_ upscaler: VideoUpscaler) {
+		stats.update { s in
+			s.upscaler = upscaler
+			s.activeUpscaler = .off
+		}
+	}
+
+	func setOutputPixelSize(_ size: CGSize) {}
+
+	func setFrameGeneration(_ mode: VideoFrameGeneration) {
+		stats.update { s in
+			s.frameGeneration = mode
+			s.frameGenerationState = mode == .off ? "native" : "inactive (layer path)"
+		}
+	}
+
 	func setPacing(_ mode: VideoPacingMode) {
 		let on = mode == .adaptive
 		onMain { [weak self] in
@@ -192,7 +209,7 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 		lock.withLock {
 			guard paced else { return }
 			if frameDelay > 0.001 {
-				lead = min(0.040, lead + frameDelay)
+				lead = min(0.0167, lead + frameDelay) // bounded: at most one 60 Hz frame
 				lastLeadChange = now
 			} else if now - lastLeadChange > 3 {
 				lead = max(0.002, lead - 0.0005)

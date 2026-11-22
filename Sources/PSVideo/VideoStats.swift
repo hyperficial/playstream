@@ -18,9 +18,22 @@ public struct VideoStats: Sendable, Equatable {
 	public var framesReceived: Int = 0
 	/// Frames the decoder produced a picture for.
 	public var framesDecoded: Int = 0
-	/// Frames received but not decoded/shown: waiting for a keyframe, decode errors, or superseded by a
-	/// newer frame before they could be shown.
+	/// Frames received but never handed to the display, for any reason except a deliberate pacer
+	/// catch-up skip (`framesSkipped`). Exactly the sum of the `drops*` counters below (plus, on the layer
+	/// path, `layerDroppedFrames + layerCorruptedFrames`). In steady state on a clean link it should stay 0;
+	/// each reason counter says where a non-zero value comes from.
 	public var framesDropped: Int = 0
+	/// Not decodable: waiting for a keyframe after a decoder reset / loss, or no usable parameter sets.
+	public var dropsAwaitingKeyframe: Int = 0
+	/// The decoder reported an error for the frame.
+	public var dropsDecodeError: Int = 0
+	/// Pacing off only: a newer frame was decoded before the render queue got to this one (newest wins).
+	public var dropsSuperseded: Int = 0
+	/// Paced queue over capacity (16 pictures, ~133 ms at 120 pictures/s). Should never happen; non-zero means
+	/// rendering stalled.
+	public var dropsQueueOverflow: Int = 0
+	/// No drawable from the layer within 1 s (display asleep / window off screen) or a render setup failure.
+	public var dropsNoDrawable: Int = 0
 	/// Sample-buffer-layer path: frames the layer itself dropped / found corrupt (included in `framesDropped`).
 	public var layerDroppedFrames: Int = 0
 	public var layerCorruptedFrames: Int = 0
@@ -77,6 +90,44 @@ public struct VideoStats: Sendable, Equatable {
 	/// last poll (AVVideoPerformanceMetrics), ms. ~0 means the layer is hitting its targets.
 	public var layerFrameDelayMs: Double?
 
+	// MARK: Upscaling (Metal path)
+
+	/// Upscaler requested through `VideoPipeline.upscaler`.
+	public var upscaler: VideoUpscaler = .off
+	/// Upscaler actually running: `.off` on the layer path, when the video rect is not larger than the
+	/// video, or before the first frame; `.bicubic` if MetalFX is unsupported.
+	public var activeUpscaler: VideoUpscaler = .off
+	public var upscaleInputWidth: Int = 0
+	public var upscaleInputHeight: Int = 0
+	/// Drawable size the picture is rendered at (= video size when not upscaling).
+	public var upscaleOutputWidth: Int = 0
+	public var upscaleOutputHeight: Int = 0
+	/// GPU time of all passes for one frame (conversion + scaling + copy), ms, last second.
+	public var renderGPUTimeAvgMs: Double?
+	public var renderGPUTimeMaxMs: Double?
+	/// GPU time of the MetalFX pass alone, ms, last second (nil unless MetalFX is active).
+	public var scalerGPUTimeAvgMs: Double?
+
+	// MARK: Frame generation (Metal path, paced)
+
+	public var frameGeneration: VideoFrameGeneration = .off
+	/// "native" (pass-through, no added latency), "fillRepeats" (repeated pictures replaced),
+	/// "doubling" (a picture generated between each pair: 30 fps stream, or 60 -> 120).
+	public var frameGenerationState: String = "native"
+	/// Content frame rate detected from new vs repeated pictures, fps.
+	public var contentFPS: Double = 0
+	/// Generated pictures shown per second (last second) and in total.
+	public var generatedFPS: Double = 0
+	public var framesGenerated: Int = 0
+	/// Slots where the generated picture was not ready in time or must not be made (shown: the repeat).
+	public var frameGenerationFallbacks: Int = 0
+	/// Of those, skipped because of a scene cut between the two pictures.
+	public var frameGenerationCutsSkipped: Int = 0
+	/// Extra hold applied while generating (wait for the next picture + processing), ms. 0 when native.
+	public var frameGenerationAddedLatencyMs: Double = 0
+	/// Last interpolation call (VideoToolbox low-latency frame interpolation), ms.
+	public var frameGenerationTimeMs: Double = 0
+
 	// MARK: On-screen cadence (Metal path, from the drawables' presented times; nil on the layer path)
 
 	/// Display refresh rate the presentation is aligned to.
@@ -87,6 +138,27 @@ public struct VideoStats: Sendable, Equatable {
 	/// Presented intervals that were not the expected number of refreshes (e.g. not 2 at 60 fps on
 	/// 120 Hz), cumulative. Each one is a visible judder.
 	public var presentedOffCadence: Int = 0
+	/// Cumulative histogram of presented intervals in display refreshes: [1, 2, 3, 4, 5, 6+].
+	public var presentedRefreshHistogram: [Int] = [0, 0, 0, 0, 0, 0]
+
+	// MARK: Present timing (Metal path, paced): requested vs actual presentation time
+
+	/// Frames that reached the glass on the requested vsync (actual - requested in [0, 1 refresh)).
+	public var presentsOnTime: Int = 0
+	/// One refresh later than requested.
+	public var presentsLate1: Int = 0
+	/// Two or more refreshes later than requested.
+	public var presentsLate2Plus: Int = 0
+	/// Handed to the compositor but never shown (reported presentedTime 0, e.g. replaced in the same vsync).
+	public var presentsNotShown: Int = 0
+	/// actual - requested presentation time, ms, last second (avg / max).
+	public var presentErrorAvgMs: Double?
+	public var presentErrorMaxMs: Double?
+	/// requested presentation time - commit time, ms, last second (minimum): how much time the compositor got.
+	public var commitAheadMinMs: Double?
+	/// Deepest paced queue and longest wait for a drawable in the last second.
+	public var pacedQueueDepthMax: Int = 0
+	public var drawableWaitMaxMs: Double = 0
 
 	public init() {}
 }
@@ -100,6 +172,12 @@ final class StatsCollector: @unchecked Sendable {
 		var handoffSum = 0.0, handoffMax = 0.0, handoffN = 0
 		var glassSum = 0.0, glassN = 0
 		var presentSum = 0.0, presentMax = 0.0, presentN = 0
+		var gpuSum = 0.0, gpuMax = 0.0, gpuN = 0
+		var errSum = 0.0, errMax = 0.0, errN = 0
+		var aheadMin = Double.infinity
+		var depthMax = 0
+		var waitMax = 0.0
+		var scalerSum = 0.0, scalerN = 0
 	}
 
 	private struct State {
@@ -141,9 +219,13 @@ final class StatsCollector: @unchecked Sendable {
 			let headroom = s.stats.edrHeadroom
 			let pacing = s.stats.pacingMode
 			let lead = s.stats.presentationLeadMs
+			let up = s.stats.upscaler
+			let fg = s.stats.frameGeneration
 			s = State()
+			s.stats.frameGeneration = fg
 			s.stats.pacingMode = pacing
 			s.stats.presentationLeadMs = lead
+			s.stats.upscaler = up
 			s.stats.codec = codec
 			s.stats.displayMode = mode
 			s.stats.edrHeadroom = headroom
@@ -161,6 +243,10 @@ final class StatsCollector: @unchecked Sendable {
 			s.stats.presentedIntervalAvgMs = nil
 			s.stats.presentedIntervalMaxMs = nil
 			s.stats.displayRefreshHz = nil
+			s.stats.renderGPUTimeAvgMs = nil
+			s.stats.renderGPUTimeMaxMs = nil
+			s.stats.scalerGPUTimeAvgMs = nil
+			s.stats.activeUpscaler = .off
 			s.stats.layerDroppedFrames = 0
 			s.stats.layerCorruptedFrames = 0
 			s.externalDecode = mode == .sampleBufferLayer
@@ -201,7 +287,64 @@ final class StatsCollector: @unchecked Sendable {
 			s.window.presentN += 1
 			s.window.presentMax = max(s.window.presentMax, ms)
 			if offCadence { s.stats.presentedOffCadence += 1 }
+			if refreshHz > 0 {
+				let n = Int((ms / 1000 * refreshHz).rounded())
+				s.stats.presentedRefreshHistogram[min(5, max(0, n - 1))] += 1
+			}
 			s.stats.displayRefreshHz = refreshHz
+		}
+	}
+
+	enum DropReason { case awaitingKeyframe, decodeError, superseded, queueOverflow, noDrawable }
+
+	func drop(_ r: DropReason, count: Int = 1) {
+		lock.withLock { s in
+			s.stats.framesDropped += count
+			switch r {
+			case .awaitingKeyframe: s.stats.dropsAwaitingKeyframe += count
+			case .decodeError: s.stats.dropsDecodeError += count
+			case .superseded: s.stats.dropsSuperseded += count
+			case .queueOverflow: s.stats.dropsQueueOverflow += count
+			case .noDrawable: s.stats.dropsNoDrawable += count
+			}
+		}
+	}
+
+	/// A paced frame reached the glass `errorMs` after its requested time.
+	func presentTiming(errorMs: Double, refresh: Double) {
+		lock.withLock { s in
+			let r = errorMs / 1000 / refresh
+			if r < 1 { s.stats.presentsOnTime += 1 } else if r < 2 { s.stats.presentsLate1 += 1 } else { s.stats.presentsLate2Plus += 1 }
+			s.window.errSum += errorMs
+			s.window.errN += 1
+			s.window.errMax = max(s.window.errMax, errorMs)
+		}
+	}
+
+	func presentNotShown() {
+		lock.withLock { $0.stats.presentsNotShown += 1 }
+	}
+
+	func pacedCommit(aheadMs: Double, queueDepth: Int, drawableWaitMs: Double) {
+		lock.withLock { s in
+			s.window.aheadMin = min(s.window.aheadMin, aheadMs)
+			s.window.depthMax = max(s.window.depthMax, queueDepth)
+			s.window.waitMax = max(s.window.waitMax, drawableWaitMs)
+		}
+	}
+
+	func renderGPU(ms: Double) {
+		lock.withLock { s in
+			s.window.gpuSum += ms
+			s.window.gpuN += 1
+			s.window.gpuMax = max(s.window.gpuMax, ms)
+		}
+	}
+
+	func scalerGPU(ms: Double) {
+		lock.withLock { s in
+			s.window.scalerSum += ms
+			s.window.scalerN += 1
 		}
 	}
 
@@ -228,6 +371,18 @@ final class StatsCollector: @unchecked Sendable {
 			s.stats.handoffMaxMs = w.handoffMax
 		}
 		if w.glassN > 0 { s.stats.glassAvgMs = w.glassSum / Double(w.glassN) }
+		if w.gpuN > 0 {
+			s.stats.renderGPUTimeAvgMs = w.gpuSum / Double(w.gpuN)
+			s.stats.renderGPUTimeMaxMs = w.gpuMax
+		}
+		s.stats.scalerGPUTimeAvgMs = w.scalerN > 0 ? w.scalerSum / Double(w.scalerN) : nil
+		if w.errN > 0 {
+			s.stats.presentErrorAvgMs = w.errSum / Double(w.errN)
+			s.stats.presentErrorMaxMs = w.errMax
+		}
+		if w.aheadMin.isFinite { s.stats.commitAheadMinMs = w.aheadMin }
+		s.stats.pacedQueueDepthMax = w.depthMax
+		s.stats.drawableWaitMaxMs = w.waitMax
 		if w.presentN > 0 {
 			s.stats.presentedIntervalAvgMs = w.presentSum / Double(w.presentN)
 			s.stats.presentedIntervalMaxMs = w.presentMax
