@@ -40,7 +40,7 @@ let package = Package(
 					"-L\(root)/build/chiaki/lib",
 					"-L\(root)/build/chiaki/third-party",
 					"-L\(root)/build/chiaki/third-party/nanopb",
-					"-L\(brew)/opt/openssl@3/lib",
+					"-L\(brew)/opt/openssl@4/lib",
 					"-L\(brew)/opt/curl/lib",
 					"-L\(brew)/lib",
 				]),

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds vendor/chiaki-ng's protocol library (static) into build/chiaki.
-# Requires: brew install pkgconf miniupnpc libevent protobuf json-c opus openssl@3 curl cmake ninja
+# Requires: brew install pkgconf miniupnpc libevent protobuf json-c opus openssl@4 curl cmake ninja
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/vendor/chiaki-ng"
@@ -13,13 +13,13 @@ if [ ! -x "$PY" ]; then
 fi
 
 BREW="$(brew --prefix)"
-export PKG_CONFIG_PATH="$BREW/opt/openssl@3/lib/pkgconfig:$BREW/opt/curl/lib/pkgconfig:$BREW/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export PKG_CONFIG_PATH="$BREW/opt/openssl@4/lib/pkgconfig:$BREW/opt/curl/lib/pkgconfig:$BREW/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 export PATH="$ROOT/build/pyenv/bin:$PATH"
 
 cmake -S "$SRC" -B "$OUT" -G Ninja \
 	-DCMAKE_BUILD_TYPE=RelWithDebInfo \
 	-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-	-DCMAKE_PREFIX_PATH="$BREW/opt/openssl@3;$BREW/opt/curl;$BREW" \
+	-DCMAKE_PREFIX_PATH="$BREW/opt/openssl@4;$BREW/opt/curl;$BREW" \
 	-DPYTHON_EXECUTABLE="$PY" \
 	-DPython3_EXECUTABLE="$PY" \
 	-DCHIAKI_ENABLE_TESTS=OFF \

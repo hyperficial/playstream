@@ -32,8 +32,13 @@ public enum CoreLog {
 		return f
 	}()
 
-	/// Call once at launch.
-	public static func install(levels: Level = .standard, echoToStderr: Bool = false) {
+	/// Opens the log file. Call once at launch.
+	///
+	/// The core's log callback is process-wide and has exactly one owner. By default this
+	/// function takes it. An app that also uses PSPairing must pass `ownCoreCallback: false`,
+	/// let `BridgeLog` own the callback (pairing needs the lines to explain failures) and
+	/// forward its lines here with `record(level:message:)`.
+	public static func install(levels: Level = .standard, echoToStderr: Bool = false, ownCoreCallback: Bool = true) {
 		queue.sync {
 			self.echoToStderr = echoToStderr
 			let url = fileURL
@@ -49,25 +54,40 @@ public enum CoreLog {
 			file = try? FileHandle(forWritingTo: url)
 			_ = try? file?.seekToEnd()
 		}
-		ps_log_set_callback({ level, msg, _ in
-			guard let msg else { return }
-			CoreLog.write(level: level, message: String(cString: msg))
-		}, nil, levels.rawValue)
-		write(level: 4, message: "──── log started ────")
+		if ownCoreCallback {
+			ps_log_set_callback({ level, msg, _ in
+				guard let msg else { return }
+				CoreLog.write(level: level, message: String(cString: msg), unified: true)
+			}, nil, levels.rawValue)
+		}
+		write(level: 4, message: "──── log started ────", unified: false)
 	}
 
-	/// Also available to the app for its own lines.
+	/// A line from the app itself.
 	public static func note(_ message: String) {
-		write(level: 4, message: message)
+		write(level: 4, message: message, unified: true)
 	}
 
-	private static func write(level: UInt32, message: String) {
+	/// A core log line forwarded by whoever owns the core callback (already in the unified log).
+	public static func record(level: UInt32, message: String) {
+		write(level: level, message: message, unified: false)
+	}
+
+	private static func write(level: UInt32, message: String, unified: Bool) {
 		let tag: String
 		switch level {
-		case 1: tag = "E"; logger.error("\(message, privacy: .public)")
-		case 2: tag = "W"; logger.warning("\(message, privacy: .public)")
-		case 4: tag = "I"; logger.info("\(message, privacy: .public)")
-		default: tag = "D"; logger.debug("\(message, privacy: .public)")
+		case 1: tag = "E"
+		case 2: tag = "W"
+		case 4: tag = "I"
+		default: tag = "D"
+		}
+		if unified {
+			switch level {
+			case 1: logger.error("\(message, privacy: .public)")
+			case 2: logger.warning("\(message, privacy: .public)")
+			case 4: logger.info("\(message, privacy: .public)")
+			default: logger.debug("\(message, privacy: .public)")
+			}
 		}
 		let now = Date()
 		queue.async {
