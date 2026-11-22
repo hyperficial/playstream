@@ -20,6 +20,28 @@ public final class VideoPipeline: VideoStreamSink {
 		set { setDisplayMode(newValue) }
 	}
 
+	/// Frame pacing. `.adaptive` (default) shows frames on a steady grid behind a small adaptive
+	/// playout delay; `.off` shows each frame the moment it is decoded. Change on the main thread.
+	public var pacingMode: VideoPacingMode {
+		get { pacingLock.withLock { pacing.mode } }
+		set { setPacingMode(newValue) }
+	}
+
+	/// Lower bound of the adaptive playout delay, ms. Default 16.7 (one frame at 60 fps): the delay a
+	/// clean link settles at. Any thread, takes effect on the next frame.
+	public var minimumPlayoutDelayMs: Double {
+		get { pacingLock.withLock { pacing.minMs } }
+		set { pacingLock.withLock { pacing.minMs = max(0, newValue); pacing.maxMs = max(pacing.maxMs, pacing.minMs) } }
+	}
+
+	/// Upper bound of the adaptive playout delay, ms. Default 50. Stalls longer than this are not
+	/// hidden: the picture holds, then catches up (and skips frames if far behind). Raise it (e.g.
+	/// 120) to ride out ~100 ms Wi-Fi stalls completely at the cost of that much latency.
+	public var maximumPlayoutDelayMs: Double {
+		get { pacingLock.withLock { pacing.maxMs } }
+		set { pacingLock.withLock { pacing.maxMs = max(0, newValue); pacing.minMs = min(pacing.minMs, pacing.maxMs) } }
+	}
+
 	/// Live statistics; cheap value copy, safe from any thread.
 	public var stats: VideoStats { collector.snapshot() }
 
@@ -50,11 +72,28 @@ public final class VideoPipeline: VideoStreamSink {
 	private var streaming = false
 	private var activity: NSObjectProtocol?
 
+	private let pacer = FramePacer()
+	private var lastPacerPublish: UInt64 = 0
+	private var lateFrames = 0
+	private var skippedFrames = 0
+
+	private struct PacingSettings {
+		var mode: VideoPacingMode
+		var minMs = 1000.0 / 60
+		var maxMs = 50.0
+	}
+
+	private let pacingLock = UnfairLock()
+	private var pacing: PacingSettings
+
 	let collector = StatsCollector()
 
-	public init(displayMode: VideoDisplayMode = .sampleBufferLayer) {
+	public init(displayMode: VideoDisplayMode = .sampleBufferLayer, pacingMode: VideoPacingMode = .adaptive) {
 		nals.reserveCapacity(64)
+		pacing = PacingSettings(mode: pacingMode)
 		renderer = Self.makeRenderer(displayMode, stats: collector)
+		renderer.setPacing(pacingMode)
+		collector.update { $0.pacingMode = pacingMode }
 		collector.reset(codec: nil, mode: displayMode)
 		screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
 			self?.screenChanged(self?.host?.window?.screen)
@@ -90,6 +129,10 @@ public final class VideoPipeline: VideoStreamSink {
 			formatDescription = nil
 			lastKeyframeRequest = 0
 			consecutiveRejects = 0
+			pacer.reset(fps: profile.fps)
+			lastPacerPublish = 0
+			lateFrames = 0
+			skippedFrames = 0
 			streaming = true
 			if activity == nil {
 				activity = ProcessInfo.processInfo.beginActivity(
@@ -176,6 +219,21 @@ public final class VideoPipeline: VideoStreamSink {
 
 		encodedTap?.encodedVideoDidProduce(sampleBuffer: sample, isKeyframe: keyframe)
 
+		// The pacer always runs (arrival jitter stats are useful with pacing off too); its schedule is
+		// only used in adaptive mode.
+		let settings = pacingLock.withLock { pacing }
+		pacer.minDelay = settings.minMs / 1000
+		pacer.maxDelay = settings.maxMs / 1000
+		var schedule = pacer.schedule(arrival: hostSeconds(arrival), framesLost: framesLost)
+		if settings.mode == .adaptive {
+			if schedule.late { lateFrames += 1 }
+			if schedule.skip { skippedFrames += 1 }
+		} else {
+			schedule = FrameSchedule(target: nil, skip: false, late: false, interval: schedule.interval)
+		}
+		scheduleObserver?(hostSeconds(arrival), schedule.target ?? .nan, schedule.skip)
+		publishPacing(settings.mode, now: arrival)
+
 		let r = rendererLock.withLock { renderer }
 		if r.needsKeyframe && !keyframe {
 			// Our decoder has no reference state; a P-frame cannot be shown. Ask for an IDR.
@@ -183,7 +241,7 @@ public final class VideoPipeline: VideoStreamSink {
 			return reject(dropped: true)
 		}
 
-		switch r.submit(sample, isKeyframe: keyframe, arrival: arrival) {
+		switch r.submit(sample, isKeyframe: keyframe, arrival: arrival, schedule: schedule) {
 		case .accepted:
 			consecutiveRejects = 0
 			return true
@@ -198,6 +256,38 @@ public final class VideoPipeline: VideoStreamSink {
 			}
 			return reject(dropped: needsKeyframe)
 		}
+	}
+
+	private func publishPacing(_ mode: VideoPacingMode, now: UInt64) {
+		guard lastPacerPublish == 0 || StatsCollector.ms(from: lastPacerPublish, to: now) >= 250 else { return }
+		lastPacerPublish = now
+		let a = pacer.arrivalStats()
+		let paced = mode == .adaptive
+		let delay = pacer.delay, target = pacer.targetDelay, fps = 1 / pacer.interval
+		let late = lateFrames, skipped = skippedFrames
+		collector.update { s in
+			s.pacingMode = mode
+			s.streamFPS = fps
+			s.arrivalJitterAvgMs = a.jitterAvg * 1000
+			s.arrivalJitterP95Ms = a.jitterP95 * 1000
+			s.arrivalMaxGapMs = a.maxGap * 1000
+			s.playoutDelayMs = paced ? delay * 1000 : 0
+			s.playoutTargetDelayMs = paced ? target * 1000 : 0
+			s.framesLate = late
+			s.framesSkipped = skipped
+		}
+	}
+
+	private func setPacingMode(_ mode: VideoPacingMode) {
+		dispatchPrecondition(condition: .onQueue(.main))
+		let changed: Bool = pacingLock.withLock {
+			let c = pacing.mode != mode
+			pacing.mode = mode
+			return c
+		}
+		guard changed else { return }
+		rendererLock.withLock { renderer }.setPacing(mode)
+		collector.update { $0.pacingMode = mode }
 	}
 
 	private func reject(dropped: Bool) -> Bool {
@@ -252,6 +342,8 @@ public final class VideoPipeline: VideoStreamSink {
 		let current = rendererLock.withLock { renderer }
 		guard current.mode != mode else { return }
 		let new = Self.makeRenderer(mode, stats: collector)
+		new.setPacing(pacingMode)
+		new.presentedObserver = current.presentedObserver
 		let config: (codec: VideoCodec, color: VideoColorInfo, fd: CMVideoFormatDescription)? = rendererLock.withLock {
 			renderer = new
 			return lastConfig
@@ -289,6 +381,19 @@ public final class VideoPipeline: VideoStreamSink {
 	/// The last decoded picture (CVPixelBuffer with its colour attachments). Diagnostic use.
 	public func copyLastDecodedPixelBuffer() -> CVPixelBuffer? {
 		rendererLock.withLock { renderer }.copyLastPixelBuffer()
+	}
+
+	/// Diagnostics: the pacer's decision for every frame (stream thread): arrival, target presentation
+	/// time (host seconds, before the renderer's presentation lead), skipped.
+	@_spi(Diagnostics)
+	public var scheduleObserver: ((_ arrival: Double, _ target: Double, _ skip: Bool) -> Void)?
+
+	/// Diagnostics: called (on an arbitrary thread) for each frame that reached the glass, with the
+	/// presented time and the frame's arrival time (host seconds). Metal path with pacing only.
+	@_spi(Diagnostics)
+	public var presentedObserver: ((_ presentedTime: Double, _ arrival: Double) -> Void)? {
+		get { rendererLock.withLock { renderer }.presentedObserver }
+		set { rendererLock.withLock { renderer }.presentedObserver = newValue }
 	}
 }
 

@@ -78,6 +78,19 @@ public final class ControllerInput: ObservableObject, ControllerFeedbackSink, Ha
 		get { rumbleGainValue.value }
 		set { rumbleGainValue.value = max(0, newValue); queue.async { [self] in applyRumble() } }
 	}
+	/// Light bar brightness, 0 (off) ... 1 (full). Scales whatever colour the console asks for; when
+	/// the console has not set one yet, a dim value still applies to the default blue so the light
+	/// is never brighter than the user wants. At exactly 1 with no console colour the light is left
+	/// to the system.
+	public var lightBrightness: Float {
+		get { lightLevel.value }
+		set { lightLevel.value = min(1, max(0, newValue)); queue.async { [self] in applyLEDAndPlayer() } }
+	}
+	/// Show the white player-number LEDs below the touchpad (default true).
+	public var playerLEDsEnabled: Bool {
+		get { playerLEDsOn.value }
+		set { playerLEDsOn.value = newValue; queue.async { [self] in applyLEDAndPlayer() } }
+	}
 	/// Read motion sensors while a receiver is set (costs controller battery / Bluetooth bandwidth).
 	public var motionEnabled: Bool {
 		get { motionOn.value }
@@ -96,6 +109,8 @@ public final class ControllerInput: ObservableObject, ControllerFeedbackSink, Ha
 	private let hapticsGain = Locked<Float>(1)
 	private let rumbleGainValue = Locked<Float>(1)
 	private let motionOn = Locked(true)
+	private let lightLevel = Locked<Float>(1)
+	private let playerLEDsOn = Locked(true)
 	private let backgroundInput = Locked(false)
 	private let hapticsThrottle = Locked<(last: UInt64, l: Float, r: Float)>((0, 0, 0))
 	private let lastHapticsPacket = Locked<UInt64>(0)
@@ -579,10 +594,17 @@ public final class ControllerInput: ObservableObject, ControllerFeedbackSink, Ha
 
 	private func applyLEDAndPlayer() {
 		guard let id = activeID, let c = entries[id]?.controller else { return }
-		if let (r, g, b) = led, let light = c.light {
-			light.color = GCColor(red: Float(r) / 255, green: Float(g) / 255, blue: Float(b) / 255)
+		let level = lightLevel.value
+		if let light = c.light, led != nil || level < 1 {
+			// Default to the DualSense's usual blue until the console picks a colour.
+			let (r, g, b) = led ?? (0, 0, 255)
+			// LED output is linear but perceived brightness is not; squaring makes the slider feel even.
+			let scale = level * level
+			light.color = GCColor(red: Float(r) / 255 * scale, green: Float(g) / 255 * scale, blue: Float(b) / 255 * scale)
 		}
-		if let p = playerIndex {
+		if !playerLEDsOn.value {
+			c.playerIndex = .indexUnset
+		} else if let p = playerIndex {
 			c.playerIndex = GCControllerPlayerIndex(rawValue: Int(p)) ?? .indexUnset
 		}
 	}

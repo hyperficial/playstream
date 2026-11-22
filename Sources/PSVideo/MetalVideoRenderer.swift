@@ -8,9 +8,15 @@ import simd
 import VideoToolbox
 
 /// Path (b): hardware `VTDecompressionSession` (real-time, asynchronous, no temporal processing) into
-/// a Metal YCbCr->RGB pass on a `CAMetalLayer`. Only the newest decoded picture is ever drawn: a frame
-/// that is superseded before the render queue gets to it is dropped, so there is never a queue of
-/// stale frames between decoder and glass.
+/// a Metal YCbCr->RGB pass on a `CAMetalLayer`.
+///
+/// Pacing off: only the newest decoded picture is drawn, immediately; a frame superseded before the
+/// render queue gets to it is dropped.
+/// Pacing adaptive: each decoded frame is rendered at once and handed to the compositor with
+/// `present(drawable, atTime: target + lead)`, so it reaches the glass on the vsync of its target
+/// time. `lead` (the compositor's own latency, ~2.5 refreshes windowed) is learned from presented-time
+/// feedback. (CAMetalDisplayLink was tried: its callbacks run 36-41 ms ahead of their presentation
+/// time, i.e. ~2 frames more latency than the compositor itself needs.)
 ///
 /// HDR: 10-bit biplanar output ('x420'), converted with the BT.2020 NCL matrix into PQ-encoded RGB on
 /// an `rgba16Float` drawable tagged ITU-R 2100 PQ with HDR10 EDR metadata, so the system maps it onto
@@ -49,11 +55,47 @@ final class MetalVideoRenderer: VideoRenderer {
 		var renderScheduled = false
 		var lastFrame: CVPixelBuffer?
 		var config = RenderConfig()
+		var appliedConfig: RenderConfig?
+
+		// Pacing.
+		var paced = false
+		var schedules: [Scheduled] = []
+		var lastPresentedTime = 0.0
+		var refresh = 1.0 / 120
+		/// Paced frames waiting for the render queue. Bounded: if drawables come back slowly (window
+		/// occluded, headless) old frames are dropped instead of holding decoder buffers, which would
+		/// eventually block VTDecompressionSessionDecodeFrame on the network thread.
+		var pacedBacklog: [PacedFrame] = []
+		var pacedScheduled = false
+		/// Requested glass time = target + lead (compositor latency). Raised on a missed vsync, lowered
+		/// by 0.5 ms after every 3 s without a miss.
+		var lead = 2.5 / 120
+		var lastMiss = 0.0
+		var lastLeadDecay = 0.0
 	}
+
+	struct PacedFrame {
+		var buffer: CVPixelBuffer
+		var arrival: UInt64
+		var at: Double
+		var interval: Double
+		var refresh: Double
+		var config: RenderConfig
+	}
+
+	struct Scheduled {
+		var arrival: UInt64
+		var target: Double?
+		var skip: Bool
+		var interval: Double
+	}
+
 
 	private let lock = UnfairLock()
 	private var shared = Shared()
-	private var appliedLayerConfig: RenderConfig? // render queue only
+	var presentedObserver: ((Double, Double) -> Void)?
+
+	private let debugPacing = ProcessInfo.processInfo.environment["PSVIDEO_DEBUG_PACING"] != nil
 
 	var needsKeyframe: Bool { lock.withLock { shared.needsKeyframe } }
 
@@ -86,6 +128,11 @@ final class MetalVideoRenderer: VideoRenderer {
 		metalLayer.allowsNextDrawableTimeout = true
 		metalLayer.drawableSize = CGSize(width: 1920, height: 1080)
 		applyLayerConfig(RenderConfig())
+		let hz = Double(NSScreen.main?.maximumFramesPerSecond ?? 120)
+		lock.withLock {
+			shared.refresh = 1 / max(30, hz)
+			shared.lead = 2.5 * shared.refresh
+		}
 	}
 
 	deinit {
@@ -97,6 +144,18 @@ final class MetalVideoRenderer: VideoRenderer {
 			isShutdown = true
 			teardownSession()
 		}
+	}
+
+	// MARK: Pacing
+
+	func setPacing(_ mode: VideoPacingMode) {
+		let on = mode == .adaptive
+		let lead: Double = lock.withLock {
+			shared.paced = on
+			shared.lastPresentedTime = 0
+			return shared.lead
+		}
+		stats.update { $0.presentationLeadMs = on ? lead * 1000 : 0 }
 	}
 
 	private func makePipeline(_ format: MTLPixelFormat) -> MTLRenderPipelineState? {
@@ -115,7 +174,7 @@ final class MetalVideoRenderer: VideoRenderer {
 		}
 	}
 
-	func submit(_ sample: CMSampleBuffer, isKeyframe: Bool, arrival: UInt64) -> SubmitResult {
+	func submit(_ sample: CMSampleBuffer, isKeyframe: Bool, arrival: UInt64, schedule: FrameSchedule) -> SubmitResult {
 		guard let fd = CMSampleBufferGetFormatDescription(sample) else { return .rejected(needsKeyframe: false) }
 		let (wantHDR, priorFailure, errorRun): (Bool, Bool, Int) = lock.withLock {
 			let f = shared.decodeFailed
@@ -156,6 +215,12 @@ final class MetalVideoRenderer: VideoRenderer {
 			guard let session else { return .rejected(needsKeyframe: true) }
 
 			let refcon = UnsafeMutableRawPointer(bitPattern: UInt(mach_absolute_time()))
+			let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+			let key = pts.isValid ? CMClockConvertHostTimeToSystemUnits(pts) : arrival
+			lock.withLock {
+				shared.schedules.append(Scheduled(arrival: key, target: schedule.target, skip: schedule.skip, interval: schedule.interval))
+				if shared.schedules.count > 32 { shared.schedules.removeFirst(shared.schedules.count - 32) }
+			}
 			var info = VTDecodeInfoFlags()
 			let status = VTDecompressionSessionDecodeFrame(
 				session, sampleBuffer: sample, flags: [._EnableAsynchronousDecompression, ._1xRealTimePlayback],
@@ -203,14 +268,24 @@ final class MetalVideoRenderer: VideoRenderer {
 			shared.consecutiveErrors = 0
 			shared.pending = nil
 			shared.lastFrame = nil
+			shared.schedules.removeAll()
+			shared.pacedBacklog.removeAll()
+			shared.lastPresentedTime = 0
 		}
-		renderQueue.async { [weak self] in self?.clearToBlack() }
+		renderQueue.async { [weak self] in
+			guard let self, let d = self.metalLayer.nextDrawable() else { return }
+			self.clear(d)
+		}
 	}
 
 	func displayDidChange(screen: NSScreen?) {
 		// The PQ-tagged drawable plus HDR10 EDR metadata lets the system re-map for each display
 		// (EDR on the XDR panel, tone mapped on an SDR monitor); force the layer config to be re-applied.
-		renderQueue.async { [weak self] in self?.appliedLayerConfig = nil }
+		let hz = Double(screen?.maximumFramesPerSecond ?? 0)
+		lock.withLock {
+			shared.appliedConfig = nil
+			if hz > 0 { shared.refresh = 1 / hz }
+		}
 	}
 
 	func copyLastPixelBuffer() -> CVPixelBuffer? {
@@ -265,6 +340,15 @@ final class MetalVideoRenderer: VideoRenderer {
 	/// VideoToolbox output (decoder thread).
 	fileprivate func didDecode(status: OSStatus, flags: VTDecodeInfoFlags, image: CVImageBuffer?, pts: CMTime, submitted: UInt64) {
 		let now = mach_absolute_time()
+		let key = pts.isValid ? CMClockConvertHostTimeToSystemUnits(pts) : 0
+		let sched: Scheduled? = lock.withLock {
+			// Outputs come in decode order (no B-frames); drop entries of frames that never produced one.
+			while let f = shared.schedules.first, f.arrival <= key {
+				shared.schedules.removeFirst()
+				if f.arrival == key { return f }
+			}
+			return nil
+		}
 		guard status == noErr, let image, !flags.contains(.frameDropped) else {
 			// Reported to the core on the next submit; consecutive errors lead to a decoder reset there.
 			lock.withLock {
@@ -279,6 +363,31 @@ final class MetalVideoRenderer: VideoRenderer {
 		}
 		stats.frameDecoded(decodeMs: StatsCollector.ms(from: submitted, to: now))
 		let arrival = pts.isValid ? CMClockConvertHostTimeToSystemUnits(pts) : submitted
+		// Paced: render now, ask the compositor to put it on glass at its target time.
+		let paced: (target: Double, interval: Double, skip: Bool, config: RenderConfig, refresh: Double)? = lock.withLock {
+			guard shared.paced, let sc = sched, let target = sc.target else { return nil }
+			shared.lastFrame = image
+			shared.consecutiveErrors = 0
+			return (target + shared.lead, sc.interval, sc.skip, shared.config, shared.refresh)
+		}
+		if let p = paced {
+			if p.skip { return } // catching up: decoded as a reference, not shown
+			let (schedule, overflow): (Bool, Bool) = lock.withLock {
+				shared.pacedBacklog.append(PacedFrame(buffer: image, arrival: arrival, at: p.target, interval: p.interval, refresh: p.refresh, config: p.config))
+				var over = false
+				if shared.pacedBacklog.count > 3 {
+					shared.pacedBacklog.removeFirst()
+					over = true
+				}
+				let sch = !shared.pacedScheduled
+				shared.pacedScheduled = true
+				return (sch, over)
+			}
+			if overflow { stats.update { $0.framesDropped += 1 } }
+			if schedule { renderQueue.async { [weak self] in self?.renderPacedBacklog() } }
+			return
+		}
+
 		let (schedule, superseded): (Bool, Bool) = lock.withLock {
 			let sup = shared.pending != nil
 			shared.pending = (image, arrival)
@@ -304,8 +413,41 @@ final class MetalVideoRenderer: VideoRenderer {
 			return (p, shared.config)
 		}
 		guard let item else { return }
-		if appliedLayerConfig != config { applyLayerConfig(config, sample: item.buffer) }
-		draw(item.buffer, arrival: item.arrival, config: config)
+		applyConfigIfNeeded(config, sample: item.buffer)
+		let t0 = CACurrentMediaTime()
+		let nd = metalLayer.nextDrawable()
+		if debugPacing { NSLog("[PSVideo pacing] nextDrawable waited %.1f ms", (CACurrentMediaTime() - t0) * 1000) }
+		guard let drawable = nd else {
+			stats.update { $0.framesDropped += 1 }
+			return
+		}
+		render(item.buffer, arrival: item.arrival, config: config, drawable: drawable, interval: nil, refresh: nil, presentAt: nil)
+	}
+
+	private func renderPacedBacklog() {
+		while true {
+			let next: PacedFrame? = lock.withLock {
+				if shared.pacedBacklog.isEmpty {
+					shared.pacedScheduled = false
+					return nil
+				}
+				return shared.pacedBacklog.removeFirst()
+			}
+			guard let f = next else { return }
+			applyConfigIfNeeded(f.config, sample: f.buffer)
+			guard let drawable = metalLayer.nextDrawable() else {
+				stats.update { $0.framesDropped += 1 }
+				continue
+			}
+			render(f.buffer, arrival: f.arrival, config: f.config, drawable: drawable, interval: f.interval, refresh: f.refresh, presentAt: f.at)
+		}
+	}
+
+	private func applyConfigIfNeeded(_ config: RenderConfig, sample: CVPixelBuffer) {
+		let needs = lock.withLock { shared.appliedConfig != config }
+		guard needs else { return }
+		applyLayerConfig(config, sample: sample)
+		lock.withLock { shared.appliedConfig = config }
 	}
 
 	private func applyLayerConfig(_ c: RenderConfig, sample: CVPixelBuffer? = nil) {
@@ -334,10 +476,11 @@ final class MetalVideoRenderer: VideoRenderer {
 			metalLayer.preferredDynamicRange = .standard
 		}
 		CATransaction.commit()
-		appliedLayerConfig = c
 	}
 
-	private func draw(_ pb: CVPixelBuffer, arrival: UInt64, config: RenderConfig) {
+	/// Draws `pb` into `drawable` and presents it. `interval`/`refresh` are set on the paced path for
+	/// cadence statistics.
+	private func render(_ pb: CVPixelBuffer, arrival: UInt64, config: RenderConfig, drawable: CAMetalDrawable, interval: Double?, refresh: Double?, presentAt: Double?) {
 		let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
 		let size = CGSize(width: w, height: h)
 		if metalLayer.drawableSize != size {
@@ -346,9 +489,8 @@ final class MetalVideoRenderer: VideoRenderer {
 			metalLayer.drawableSize = size
 			CATransaction.commit()
 		}
-		guard let (yTex, cTex, uniforms) = makeTextures(pb, matrix: config.matrix) else { return }
-		guard let drawable = metalLayer.nextDrawable(),
-		      let pipeline = pipelines[metalLayer.pixelFormat],
+		guard let (yTex, cTex, uniforms) = makeTextures(pb, matrix: config.matrix),
+		      let pipeline = pipelines[drawable.texture.pixelFormat],
 		      let cmd = commandQueue.makeCommandBuffer()
 		else {
 			stats.update { $0.framesDropped += 1 }
@@ -361,12 +503,50 @@ final class MetalVideoRenderer: VideoRenderer {
 		guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
 		encode(enc, pipeline: pipeline, y: yTex, c: cTex, uniforms: uniforms)
 
-		let arrivalSeconds = Double(arrival) * Double(StatsCollector.timebase.numer) / Double(StatsCollector.timebase.denom) / 1e9
+		let arrivalSeconds = hostSeconds(arrival)
 		let stats = self.stats
-		drawable.addPresentedHandler { d in
-			if d.presentedTime > 0 { stats.onGlass(ms: (d.presentedTime - arrivalSeconds) * 1000) }
+		drawable.addPresentedHandler { [weak self] d in
+			let t = d.presentedTime
+			guard t > 0 else { return }
+			stats.onGlass(ms: (t - arrivalSeconds) * 1000)
+			guard let self else { return }
+			self.presentedObserver?(t, arrivalSeconds)
+			guard let interval, let refresh else { return }
+			let (last, lead): (Double, Double) = self.lock.withLock {
+				let l = self.shared.lastPresentedTime
+				self.shared.lastPresentedTime = t
+				if let at = presentAt {
+					let now = CACurrentMediaTime()
+					let miss = t - at
+					if miss > refresh * 0.5 && miss < 0.2 {
+						// The compositor could not make the requested vsync: hand frames over earlier.
+						self.shared.lead = min(0.060, self.shared.lead + miss)
+						self.shared.lastMiss = now
+					} else if now - self.shared.lastMiss > 3, now - self.shared.lastLeadDecay > 3 {
+						self.shared.lead = max(refresh, self.shared.lead - 0.0005)
+						self.shared.lastLeadDecay = now
+					}
+				}
+				return (l, self.shared.lead)
+			}
+			stats.update { $0.presentationLeadMs = lead * 1000 }
+			guard last > 0 else { return }
+			let dt = t - last
+			let expected = max(1, (interval / refresh).rounded())
+			let actual = (dt / refresh).rounded()
+			stats.presentedInterval(ms: dt * 1000, offCadence: actual != expected, refreshHz: 1 / refresh)
 		}
-		cmd.present(drawable)
+		if let at = presentAt {
+			if debugPacing {
+				let commit = CACurrentMediaTime()
+				drawable.addPresentedHandler { d in
+					NSLog("[PSVideo pacing] arrival->at %.1f commit->at %.1f at->shown %.1f commit->shown %.1f ms", (at - arrivalSeconds) * 1000, (at - commit) * 1000, (d.presentedTime - at) * 1000, (d.presentedTime - commit) * 1000)
+				}
+			}
+			cmd.present(drawable, atTime: at)
+		} else {
+			cmd.present(drawable)
+		}
 		cmd.addCompletedHandler { _ in
 			// Keep the CVMetalTextures (and so the IOSurfaces) alive until the GPU is done.
 			_ = yTex
@@ -448,8 +628,8 @@ final class MetalVideoRenderer: VideoRenderer {
 		return Uniforms(matrix: m, yScale: toCode / yRange, yOffset: -yLo / yRange, cScale: toCode / cRange, cOffset: -cMid / cRange)
 	}
 
-	private func clearToBlack() {
-		guard let drawable = metalLayer.nextDrawable(), let cmd = commandQueue.makeCommandBuffer() else { return }
+	private func clear(_ drawable: CAMetalDrawable) {
+		guard let cmd = commandQueue.makeCommandBuffer() else { return }
 		let pass = MTLRenderPassDescriptor()
 		pass.colorAttachments[0].texture = drawable.texture
 		pass.colorAttachments[0].loadAction = .clear
@@ -530,3 +710,4 @@ private let psvDecodeCallback: VTDecompressionOutputCallback = { refCon, frameRe
 	let r = Unmanaged<MetalVideoRenderer>.fromOpaque(refCon).takeUnretainedValue()
 	r.didDecode(status: status, flags: flags, image: image, pts: pts, submitted: UInt64(UInt(bitPattern: frameRefCon)))
 }
+

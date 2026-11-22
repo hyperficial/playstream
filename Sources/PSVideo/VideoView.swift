@@ -9,6 +9,9 @@ public final class VideoView: NSView {
 	public let pipeline: VideoPipeline
 	private let rootLayer = VideoRootLayer()
 	private var screenObserver: NSObjectProtocol?
+	/// Asks for the screen's maximum refresh rate while the view is on screen, so ProMotion does not
+	/// drop the panel below 120 Hz under the video (60 fps content then gets a steady 2-refresh cadence).
+	private var refreshKeeper: CADisplayLink?
 
 	public init(pipeline: VideoPipeline) {
 		self.pipeline = pipeline
@@ -39,7 +42,13 @@ public final class VideoView: NSView {
 		super.viewDidMoveToWindow()
 		if let o = screenObserver { NotificationCenter.default.removeObserver(o) }
 		screenObserver = nil
+		refreshKeeper?.invalidate()
+		refreshKeeper = nil
 		guard let window else { return }
+		let link = displayLink(target: self, selector: #selector(refreshTick(_:)))
+		link.add(to: .main, forMode: .common)
+		refreshKeeper = link
+		applyRefreshRange()
 		screenObserver = NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification, object: window, queue: .main) { [weak self] _ in
 			self?.screenDidChange()
 		}
@@ -53,13 +62,22 @@ public final class VideoView: NSView {
 		rootLayer.content?.contentsScale = scale
 	}
 
+	@objc private func refreshTick(_ link: CADisplayLink) {}
+
+	private func applyRefreshRange() {
+		let hz = Float(window?.screen?.maximumFramesPerSecond ?? 120)
+		refreshKeeper?.preferredFrameRateRange = CAFrameRateRange(minimum: hz, maximum: hz, preferred: hz)
+	}
+
 	private func screenDidChange() {
+		applyRefreshRange()
 		viewDidChangeBackingProperties()
 		pipeline.screenChanged(window?.screen)
 	}
 
 	deinit {
 		if let o = screenObserver { NotificationCenter.default.removeObserver(o) }
+		refreshKeeper?.invalidate()
 	}
 }
 

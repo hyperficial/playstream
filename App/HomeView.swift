@@ -121,7 +121,7 @@ struct HomeView: View {
 				}
 				.help("Stream settings")
 				.popover(isPresented: $showSettings, arrowEdge: .bottom) {
-					SettingsView(settings: model.settings)
+					SettingsView(settings: model.settings, input: model.input)
 				}
 			}
 		}

@@ -5,6 +5,17 @@ import os
 import PSContracts
 import QuartzCore
 
+/// When decoded frames are shown.
+public enum VideoPacingMode: String, Sendable, CaseIterable, Codable {
+	/// Each frame is shown the moment it is decoded. Lowest latency; network jitter and bursts are
+	/// visible as judder / freezes.
+	case off
+	/// Frames are shown on a steady grid at the stream's frame interval, behind a small adaptive
+	/// playout delay that absorbs arrival jitter (see `VideoPipeline.minimumPlayoutDelayMs` /
+	/// `maximumPlayoutDelayMs`), aligned to display refreshes.
+	case adaptive
+}
+
 /// How decoded video reaches the screen.
 public enum VideoDisplayMode: String, Sendable, CaseIterable, Codable {
 	/// Compressed samples go straight into an `AVSampleBufferDisplayLayer` (system decode + composite),
@@ -30,7 +41,11 @@ protocol VideoRenderer: AnyObject {
 	/// True until a keyframe has been accepted since creation / the last flush or decoder reset.
 	var needsKeyframe: Bool { get }
 	func configure(codec: VideoCodec, color: VideoColorInfo, formatDescription: CMVideoFormatDescription)
-	func submit(_ sample: CMSampleBuffer, isKeyframe: Bool, arrival: UInt64) -> SubmitResult
+	func submit(_ sample: CMSampleBuffer, isKeyframe: Bool, arrival: UInt64, schedule: FrameSchedule) -> SubmitResult
+	/// Pacing switched on/off (main thread).
+	func setPacing(_ mode: VideoPacingMode)
+	/// Diagnostics: each frame that reached the glass (host seconds), with its arrival time. Metal paced path only.
+	var presentedObserver: ((_ presentedTime: Double, _ arrival: Double) -> Void)? { get set }
 	/// Stream ended or restarting: drop decoder state and the shown image.
 	func reset()
 	/// The hosting window moved to another screen or the screen's EDR capability changed (main thread).

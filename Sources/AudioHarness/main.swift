@@ -16,6 +16,9 @@ import PSContracts
 //   --volume V (live, default 1; use 0 for numbers only)               --no-jitter
 //   --burst-at S --burst-chunks N   one burst without a preceding gap (default 3.0 s / 7 chunks live;
 //                                   off unless given in offline mode)
+//   --phases "wifi:180,clean:180,wifi:180"   link profile over time (wifi = 60-115 ms stall every ~0.5 s then the
+//                                   backlog at once; mild = 30-80 ms every ~1 s; clean). Default: mild (clean with --no-jitter)
+//   --fixed MS   pin the target (adaptive off)   --max-target MS (200)
 //   --rate-flip   live: flip the output device's sample rate mid-run to exercise rebuild handling
 //   --seed N
 
@@ -26,7 +29,6 @@ func arg(_ name: String) -> String? {
 func flag(_ name: String) -> Bool { CommandLine.arguments.contains(name) }
 
 let mode = arg("--mode") ?? "live"
-let targetMs = Double(arg("--target") ?? "") ?? 35
 let senderRate = Double(arg("--sender-rate") ?? "") ?? 48050
 let ampDb = Double(arg("--amp-db") ?? "") ?? -30
 let jitter = !flag("--no-jitter")
@@ -41,6 +43,28 @@ struct RNG {
 	mutating func range(_ a: Double, _ b: Double) -> Double { a + (b - a) * next() }
 }
 
+struct StallProfile {
+	var durMin: Double, durMax: Double, afterMin: Double, afterMax: Double
+	static let mild = StallProfile(durMin: 0.030, durMax: 0.080, afterMin: 0.5, afterMax: 1.2)
+	static let wifi = StallProfile(durMin: 0.060, durMax: 0.115, afterMin: 0.33, afterMax: 0.47)
+	static func named(_ n: String) -> StallProfile? {
+		switch n {
+		case "mild": return .mild
+		case "wifi": return .wifi
+		default: return nil
+		}
+	}
+}
+
+/// Link profile over time: (name, seconds). "clean" = no stalls.
+func parsePhases(_ spec: String) -> [(String, Double)] {
+	spec.split(separator: ",").compactMap { part in
+		let kv = part.split(separator: ":")
+		guard kv.count == 2, let d = Double(kv[1]) else { return nil }
+		return (String(kv[0]), d)
+	}
+}
+
 /// Produces 480-frame chunks on the sender's clock, with network-style gaps and bursts.
 final class Feeder {
 	let interval: Double
@@ -51,23 +75,31 @@ final class Feeder {
 	var phase = 0.0
 	var sampleIndex = 0
 	var holdStart = -1.0, holdEnd = -1.0
-	var nextStall: Double
+	var nextStall = 0.3
 	var burstAt: Double?
 	var burstChunks = 0
 	var chunksDelivered = 0
 	var stalls = 0
 	var buf = [Int16](repeating: 0, count: 960)
+	let phases: [(String, Double)]
 
-	init(senderRate: Double, ampDb: Double, jitter: Bool, seed: UInt64, burstAt: Double?, burstChunks: Int) {
+	init(senderRate: Double, ampDb: Double, phases: [(String, Double)], seed: UInt64, burstAt: Double?, burstChunks: Int) {
 		interval = 480.0 / senderRate
 		amp = pow(10, ampDb / 20) * 32767
 		rng = RNG(s: seed &* 7919 &+ 17)
-		nextStall = jitter ? rng.range(0.4, 0.9) : .infinity
+		self.phases = phases
 		self.burstAt = burstAt
 		self.burstChunks = burstChunks
-		self.jitter = jitter
 	}
-	let jitter: Bool
+
+	func profile(at t: Double) -> StallProfile? {
+		var start = 0.0
+		for (name, d) in phases {
+			if t < start + d { return StallProfile.named(name) }
+			start += d
+		}
+		return phases.last.flatMap { StallProfile.named($0.0) }
+	}
 
 	func fillChunk() {
 		for i in 0..<480 {
@@ -83,8 +115,8 @@ final class Feeder {
 		}
 	}
 
-	/// Delivers every chunk due by time `t` (seconds since start) to `sink`.
-	func deliver(upTo t: Double, _ sink: (UnsafeBufferPointer<Int16>) -> Void) {
+	/// Delivers every chunk due by time `t` (seconds since start) to `sink`, with its arrival time.
+	func deliver(upTo t: Double, _ sink: (UnsafeBufferPointer<Int16>, Double) -> Void) {
 		if let b = burstAt, t >= b {
 			shift += burstChunks
 			burstAt = nil
@@ -92,15 +124,19 @@ final class Feeder {
 		while true {
 			let tn = Double(n - shift) * interval
 			if tn >= nextStall {
-				holdStart = nextStall
-				holdEnd = holdStart + rng.range(0.030, 0.080)
-				nextStall = holdEnd + rng.range(0.5, 1.2)
-				stalls += 1
+				if let p = profile(at: tn) {
+					holdStart = nextStall
+					holdEnd = holdStart + rng.range(p.durMin, p.durMax)
+					nextStall = holdEnd + rng.range(p.afterMin, p.afterMax)
+					stalls += 1
+				} else {
+					nextStall = tn + 0.25
+				}
 			}
 			let te = (tn >= holdStart && tn < holdEnd) ? holdEnd : tn
 			if te > t { break }
 			fillChunk()
-			buf.withUnsafeBufferPointer { sink(UnsafeBufferPointer(rebasing: $0[0..<960])) }
+			buf.withUnsafeBufferPointer { sink(UnsafeBufferPointer(rebasing: $0[0..<960]), te) }
 			chunksDelivered += 1
 			n += 1
 		}
@@ -113,18 +149,34 @@ final class Feeder {
 	}
 }
 
+func makeConfiguration(headless: Bool) -> AudioPipelineConfiguration {
+	var cfg = AudioPipelineConfiguration()
+	cfg.headless = headless
+	if let fixed = arg("--fixed").flatMap(Double.init) {
+		cfg.targetBufferMs = fixed
+		cfg.adaptive = false
+	} else if let t = arg("--target").flatMap(Double.init) {
+		cfg.targetBufferMs = t
+	}
+	if let m = arg("--max-target").flatMap(Double.init) { cfg.maxTargetMs = m }
+	return cfg
+}
+
 func line(_ s: String) { print(s); fflush(stdout) }
 
 // MARK: - Offline
 
+func defaultPhases(_ seconds: Double) -> [(String, Double)] {
+	if let spec = arg("--phases") { return parsePhases(spec) }
+	return [(jitter ? "mild" : "clean", seconds)]
+}
+
 func runOffline() {
-	let seconds = Double(arg("--seconds") ?? "") ?? 120
-	var cfg = AudioPipelineConfiguration()
-	cfg.targetBufferMs = targetMs
-	cfg.headless = true
-	let pipe = AudioPipeline(configuration: cfg)
+	let phases = defaultPhases(Double(arg("--seconds") ?? "") ?? 120)
+	let seconds = arg("--phases") != nil ? phases.reduce(0) { $0 + $1.1 } : (Double(arg("--seconds") ?? "") ?? 120)
+	let pipe = AudioPipeline(configuration: makeConfiguration(headless: true))
 	let burstAt = arg("--burst-at").flatMap(Double.init)
-	let feeder = Feeder(senderRate: senderRate, ampDb: ampDb, jitter: jitter, seed: seed,
+	let feeder = Feeder(senderRate: senderRate, ampDb: ampDb, phases: phases, seed: seed,
 	                    burstAt: burstAt, burstChunks: Int(arg("--burst-chunks") ?? "") ?? 7)
 	pipe.audioStreamDidConfigure(channels: 2, sampleRate: 48000)
 
@@ -132,48 +184,75 @@ func runOffline() {
 	let total = Int(seconds * 48000) / cb * cb
 	var out = [Float](repeating: 0, count: total)
 	var block = [Float](repeating: 0, count: cb * 2)
-	var fills: [Double] = []
-	var fillTimeline: [(Double, Double)] = []
 	var lastUnderruns = 0
-	var eventSamples: [Int] = []  // render positions where an underrun happened
-	line(String(format: "offline: %.0f s, target %.0f ms, sender %.0f Hz, jitter %@, burst %@", seconds, targetMs, senderRate,
-	            jitter ? "on" : "off", burstAt.map { "at \($0)s" } ?? "off"))
-	var maxFill = 0.0, minFill = 1e9
+	var eventSamples: [Int] = []
+	let cfg0 = pipe.stats
+	line(String(format: "offline: %.0f s, %@ (min %.0f max %.0f ms), sender %.0f Hz, phases %@, burst %@", seconds,
+	            cfg0.adaptiveTarget ? "adaptive" : "fixed", pipe.targetBufferMs, pipe.maxTargetMs, senderRate,
+	            phases.map { "\($0.0):\(Int($0.1))s" }.joined(separator: ","), burstAt.map { "at \($0)s" } ?? "off"))
+
+	// Per-second samples.
+	var secTarget: [Double] = [], secBuf: [Double] = [], secGap: [Double] = [], secUnder: [Int] = [], secSkip: [Int] = [], secPlaying: [Double] = []
+	var accBuf = 0.0, accN = 0, accPlay = 0.0
 	var k = 0
 	while k * cb < total {
 		let t = Double(k * cb) / 48000
-		feeder.deliver(upTo: t) { chunk in
-			pipe.audioStreamDidReceive(pcm: chunk, frameCount: 480)
+		feeder.deliver(upTo: t) { chunk, te in
+			pipe.audioStreamDidReceive(pcm: chunk, frameCount: 480, simulatedArrivalSeconds: te)
 		}
 		pipe.renderHeadless(into: &block, frameCount: cb)
 		for i in 0..<cb { out[k * cb + i] = block[i * 2] }
 		let st = pipe.stats
 		if st.underruns != lastUnderruns { lastUnderruns = st.underruns; eventSamples.append(k * cb) }
-		if st.isPlaying && t > 2 {
-			fills.append(st.bufferedMs)
-			maxFill = max(maxFill, st.bufferedMs)
-			minFill = min(minFill, st.bufferedMs)
-		}
-		if k % (48000 * 10 / cb) == 0 || (burstAt != nil && abs(t - (burstAt! + 0.0)) < 0.006) {
-			fillTimeline.append((t, st.bufferedMs))
+		accBuf += st.bufferedMs
+		accPlay += st.isPlaying ? 1 : 0
+		accN += 1
+		if (k + 1) * cb % 48000 < cb {
+			secTarget.append(st.targetMs); secBuf.append(accBuf / Double(accN)); secGap.append(st.longestGapMs)
+			secUnder.append(st.underruns); secSkip.append(st.skips); secPlaying.append(accPlay / Double(accN))
+			accBuf = 0; accN = 0; accPlay = 0
 		}
 		k += 1
 	}
 	let st = pipe.stats
-	line("t(s)   buffered(ms)")
-	for (t, f) in fillTimeline { line(String(format: "%6.1f %7.1f", t, f)) }
-	let mean = fills.reduce(0, +) / Double(max(1, fills.count))
-	// Thirds of the run, to show there is no creep.
-	let third = max(1, fills.count / 3)
-	func avg(_ a: ArraySlice<Double>) -> Double { a.reduce(0, +) / Double(max(1, a.count)) }
-	line(String(format: "buffered while playing (after 2 s): mean %.1f  min %.1f  max %.1f ms; thirds of run: %.1f / %.1f / %.1f",
-	            mean, minFill, maxFill, avg(fills[0..<third]), avg(fills[third..<(2 * third)]), avg(fills[(2 * third)...])))
-	line("chunks fed \(feeder.chunksDelivered) (\(feeder.stalls) gaps)  underruns \(st.underruns)  skips \(st.skips)  overruns \(st.overruns)  trim now \(st.driftTrimPPM) ppm")
 
-	// Click analysis: second difference of a smooth sine stays under A*(2*pi*fmax/fs)^2 even when resampled by 1.5%.
+	// Per-phase report.
+	var start = 0
+	for (name, dur) in phases {
+		let end = min(secTarget.count, start + Int(dur))
+		guard end > start + 1 else { break }
+		let u0 = start == 0 ? 0 : secUnder[start - 1]
+		let uEnd = secUnder[end - 1]
+		let minutes = Double(end - start) / 60
+		let settleFrom = max(start, end - 30)
+		let settled = secTarget[settleFrom..<end].reduce(0, +) / Double(end - settleFrom)
+		var lastOut = start
+		for i in start..<end where abs(secTarget[i] - settled) > max(5, 0.1 * settled) { lastOut = i + 1 }
+		let uAfter = secUnder[end - 1] - secUnder[min(end - 1, start + 30)]
+		let bufMean = secBuf[settleFrom..<end].reduce(0, +) / Double(end - settleFrom)
+		line(String(format: "phase %-5@ %4.0f s: underruns %3d (%.1f/min), after first 30 s %.1f/min | skips %d | target min %.0f max %.0f, settled %.0f ms (stays within band after %d s) | buffered mean (last 30 s) %.0f ms",
+		            name, dur, uEnd - u0, Double(uEnd - u0) / minutes, Double(uAfter) / (Double(end - start - 30) / 60), secSkip[end - 1] - (start == 0 ? 0 : secSkip[start - 1]),
+		            secTarget[start..<end].min() ?? 0, secTarget[start..<end].max() ?? 0, settled, lastOut - start, bufMean))
+		// Timeline: target and buffered level.
+		var row = "   t+s :"
+		var row2 = "target :"
+		var row3 = "buffer :"
+		var row4 = "gap10s :"
+		for d in [1, 2, 3, 5, 8, 12, 20, 30, 45, 60, 90, 120, 150, 179] where start + d < end {
+			row += String(format: " %5d", d)
+			row2 += String(format: " %5.0f", secTarget[start + d])
+			row3 += String(format: " %5.0f", secBuf[start + d])
+			row4 += String(format: " %5.0f", secGap[start + d])
+		}
+		line(row); line(row2); line(row3); line(row4)
+		start = end
+	}
+	let fills = secBuf.dropFirst(2)
+	line(String(format: "overall: chunks fed %d (%d stalls)  underruns %d  skips %d  overruns %d  mean buffered %.1f ms", feeder.chunksDelivered, feeder.stalls, st.underruns, st.skips, st.overruns, fills.reduce(0, +) / Double(max(1, fills.count))))
+
+	// Click analysis: second difference of a smooth sine stays under A*(2*pi*fmax/fs)^2 even when resampled by 4 %.
 	let a = pow(10, ampDb / 20)
-	let bound = a * pow(2 * Double.pi * 1500 / 48000 * 1.015, 2) * 1.3 + 0.0002
-	// Exempt underrun callbacks and neighbourhoods of exact silence (fade-out / priming) - those are counted as underruns.
+	let bound = a * pow(2 * Double.pi * 1500 / 48000 * 1.04, 2) * 1.3 + 0.0002
 	var nearSilence = [Bool](repeating: false, count: total)
 	var run = 0
 	for i in 0..<total {
@@ -182,7 +261,7 @@ func runOffline() {
 			run = 0
 		}
 	}
-	for e in eventSamples { for j in e..<min(total, e + cb + 400) { nearSilence[j] = true } }
+	for e in eventSamples { for j in max(0, e - cb)..<min(total, e + 2 * cb + 400) { nearSilence[j] = true } }
 	var clicks = 0
 	var worst = 0.0
 	var worstAt = 0
@@ -191,15 +270,15 @@ func runOffline() {
 		for i in 1..<(total - 1) where !nearSilence[i] && !nearSilence[i - 1] && !nearSilence[i + 1] {
 			let d2 = Double(abs(out[i + 1] - 2 * out[i] + out[i - 1]))
 			if d2 > worst { worst = d2; worstAt = i }
-			if d2 > bound { clicks += 1; if firstClicks.count < 12 { firstClicks.append(i) } }
+			if d2 > bound { clicks += 1; if firstClicks.count < 8 { firstClicks.append(i) } }
 		}
 	}
 	for c in firstClicks {
 		let near = eventSamples.min(by: { abs($0 - c) < abs($1 - c) }).map { $0 - c } ?? 0
-		line("  click at \(c): nearest underrun callback offset \(near) samples; out[c-3...c+3] = \((-3...3).map { String(format: "%.4f", out[c + $0]) })")
+		line("  click at \(c) (\(String(format: "%.3f", Double(c) / 48000)) s): nearest underrun callback offset \(near) samples; out[c-3...c+3] = \((-3...3).map { String(format: "%.4f", out[c + $0]) })")
 	}
-	line(String(format: "click check outside silence gaps: max |d2| %.5f at %.3fs, bound %.5f, exceedances %d %@",
-	            worst, Double(worstAt) / 48000, bound, clicks, firstClicks.map { String(format: "%.3fs", Double($0) / 48000) }.description))
+	line(String(format: "click check outside underrun fades: max |d2| %.5f at %.3fs, bound %.5f, exceedances %d",
+	            worst, Double(worstAt) / 48000, bound, clicks))
 	pipe.audioStreamDidStop()
 }
 
@@ -230,18 +309,16 @@ final class CountingTap: PCMAudioTap {
 
 func runLive() {
 	let seconds = Double(arg("--seconds") ?? "") ?? 6
-	var cfg = AudioPipelineConfiguration()
-	cfg.targetBufferMs = targetMs
-	let pipe = AudioPipeline(configuration: cfg)
+	let pipe = AudioPipeline(configuration: makeConfiguration(headless: false))
 	pipe.logHandler = { line("  [audio] \($0)") }
 	pipe.volume = Float(arg("--volume") ?? "") ?? 1
 	let tap = CountingTap()
 	pipe.pcmTap = tap
 	let burstChunks = Int(arg("--burst-chunks") ?? "") ?? 7
 	let burstAt = arg("--burst-at").flatMap(Double.init) ?? (jitter && seconds >= 5 ? 3.0 : nil)
-	let feeder = Feeder(senderRate: senderRate, ampDb: ampDb, jitter: jitter, seed: seed, burstAt: burstAt, burstChunks: burstChunks)
+	let feeder = Feeder(senderRate: senderRate, ampDb: ampDb, phases: defaultPhases(seconds), seed: seed, burstAt: burstAt, burstChunks: burstChunks)
 	line(String(format: "live: %.0f s, target %.0f ms, sender %.0f Hz, amp %.0f dBFS, volume %.2f, jitter %@, burst %@",
-	            seconds, targetMs, senderRate, ampDb, pipe.volume, jitter ? "on" : "off", burstAt.map { "at \($0)s" } ?? "off"))
+	            seconds, pipe.targetBufferMs, senderRate, ampDb, pipe.volume, jitter ? "on" : "off", burstAt.map { "at \($0)s" } ?? "off"))
 
 	nonisolated(unsafe) var running = true
 	let start = machSeconds() + 0.05
@@ -249,7 +326,7 @@ func runLive() {
 		pipe.audioStreamDidConfigure(channels: 2, sampleRate: 48000)
 		while running {
 			let t = machSeconds() - start
-			feeder.deliver(upTo: t) { chunk in
+			feeder.deliver(upTo: t) { chunk, _ in
 				pipe.audioStreamDidReceive(pcm: chunk, frameCount: 480)
 			}
 			sleepUntil(start + min(feeder.nextWake(), t + 0.02))
@@ -263,7 +340,7 @@ func runLive() {
 	var samples: [Double] = []
 	var next = 0.0
 	var lastPrint = -1.0
-	line("t(s)  buffered  target  play  under  skip  overrun  trim(ppm)  devHz   outLat(ms)  total(ms)")
+	line("t(s)  buffered  target  play  under  skip  overrun  trim(ppm)  devHz   outLat(ms)  total(ms)  maxgap(ms)")
 	while true {
 		let t = machSeconds() - start
 		if t >= seconds + 0.3 { break }
@@ -272,9 +349,9 @@ func runLive() {
 			if t > 1.5 && s.isPlaying { samples.append(s.bufferedMs) }
 			if t - lastPrint >= 0.5 {
 				lastPrint = t
-				line(String(format: "%4.1f  %6.1f ms %5.0f   %@    %3d   %3d   %3d    %6d   %6.0f  %8.1f   %8.1f",
+				line(String(format: "%4.1f  %6.1f ms %5.0f   %@    %3d   %3d   %3d    %6d   %6.0f  %8.1f   %8.1f   %6.0f",
 				            t, s.bufferedMs, s.targetMs, s.isPlaying ? "y" : "n", s.underruns, s.skips, s.overruns,
-				            s.driftTrimPPM, s.outputSampleRate, s.outputLatencyMs, s.totalLatencyMs))
+				            s.driftTrimPPM, s.outputSampleRate, s.outputLatencyMs, s.totalLatencyMs, s.longestGapMs))
 			}
 			next = t + 0.02
 		}

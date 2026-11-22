@@ -25,11 +25,22 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 	private struct Metrics {
 		var total = 0, dropped = 0, corrupted = 0
 		var time: CFTimeInterval = 0
+		var delay: Double = 0
 	}
+	private var lastDelaySample: (total: Int, delay: Double)?
 	// metricsLock: the layer's counters are cumulative for its lifetime, so each stream gets a baseline.
 	private let metricsLock = UnfairLock()
 	private var baseline = Metrics()
 	private var lastSample: Metrics?
+
+	/// Host-clock timebase (time == host time, rate 1): sample PTS are absolute host times.
+	private let timebase: CMTimebase
+	private var paced = false // lock
+	/// Added to paced PTS so the layer has time to decode and composite; learned from the layer's
+	/// accumulated frame delay (lock).
+	private var lead = 0.004
+	private var lastLeadChange = 0.0
+	var presentedObserver: ((Double, Double) -> Void)?
 
 	var layer: CALayer { displayLayer }
 	var needsKeyframe: Bool { lock.withLock { flags.needsKeyframe } }
@@ -41,6 +52,11 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 		displayLayer.backgroundColor = NSColor.black.cgColor
 		displayLayer.preventsDisplaySleepDuringVideoPlayback = true
 		renderer = displayLayer.sampleBufferRenderer
+		var tb: CMTimebase?
+		CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &tb)
+		timebase = tb!
+		CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
+		CMTimebaseSetRate(timebase, rate: 1)
 
 		let nc = NotificationCenter.default
 		observers.append(nc.addObserver(forName: AVSampleBufferVideoRenderer.didFailToDecodeNotification, object: renderer, queue: nil) { [weak self] note in
@@ -81,7 +97,51 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 		}
 	}
 
-	func submit(_ sample: CMSampleBuffer, isKeyframe: Bool, arrival: UInt64) -> SubmitResult {
+	func setPacing(_ mode: VideoPacingMode) {
+		let on = mode == .adaptive
+		onMain { [weak self] in
+			guard let self else { return }
+			// A control timebase and DisplayImmediately must not be combined (AVFoundation docs), so
+			// the timebase is installed before paced samples flow and removed after they stop.
+			if on {
+				CMTimebaseSetTime(self.timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
+				self.displayLayer.controlTimebase = self.timebase
+				self.lock.withLock { self.paced = true }
+			} else {
+				self.lock.withLock { self.paced = false }
+				self.displayLayer.controlTimebase = nil
+			}
+		}
+	}
+
+	/// Shallow copy (shares the data) with the display timing and attachments; the original sample
+	/// (arrival PTS) belongs to the tap and is never mutated.
+	private func displaySample(_ sample: CMSampleBuffer, schedule: FrameSchedule, paced: Bool) -> CMSampleBuffer {
+		var timing = CMSampleTimingInfo(
+			duration: CMSampleBufferGetDuration(sample),
+			presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
+			decodeTimeStamp: .invalid)
+		let usePTS = paced && schedule.target != nil
+		if usePTS, let t = schedule.target {
+			timing.presentationTimeStamp = CMTime(seconds: t, preferredTimescale: 1_000_000_000)
+		}
+		var copy: CMSampleBuffer?
+		guard CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault, sampleBuffer: sample, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &copy) == noErr,
+		      let copy else { return sample }
+		if let attachments = CMSampleBufferGetSampleAttachmentsArray(copy, createIfNecessary: true), CFArrayGetCount(attachments) > 0 {
+			let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+			let yes = Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+			if !usePTS {
+				CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(), yes)
+			}
+			if schedule.skip {
+				CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DoNotDisplay).toOpaque(), yes)
+			}
+		}
+		return copy
+	}
+
+	func submit(_ sample: CMSampleBuffer, isKeyframe: Bool, arrival: UInt64, schedule: FrameSchedule) -> SubmitResult {
 		let (mustFlush, decodeFailed): (Bool, Bool) = lock.withLock {
 			let f = flags.requiresFlush
 			let d = flags.decodeFailed
@@ -96,7 +156,10 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 			if !isKeyframe { return .rejected(needsKeyframe: true) }
 		}
 
-		renderer.enqueue(sample)
+		let (paced, lead) = lock.withLock { (self.paced, self.lead) }
+		var s = schedule
+		if let t = s.target { s.target = t + lead }
+		renderer.enqueue(displaySample(sample, schedule: s, paced: paced))
 		stats.handedOff(ms: StatsCollector.ms(from: arrival, to: mach_absolute_time()))
 		if isKeyframe { lock.withLock { flags.needsKeyframe = false } }
 
@@ -125,6 +188,19 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 		renderer.displayedPixelBuffer()
 	}
 
+	private func adjustLead(frameDelay: Double, now: Double) {
+		lock.withLock {
+			guard paced else { return }
+			if frameDelay > 0.001 {
+				lead = min(0.040, lead + frameDelay)
+				lastLeadChange = now
+			} else if now - lastLeadChange > 3 {
+				lead = max(0.002, lead - 0.0005)
+				lastLeadChange = now
+			}
+		}
+	}
+
 	/// The layer decodes internally, so decoded / dropped counts come from its performance metrics.
 	private func startMetricsTimer() {
 		onMain { [weak self] in
@@ -139,7 +215,16 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 		renderer.loadVideoPerformanceMetrics { [weak self] m in
 			guard let self, let m else { return }
 			let now = CACurrentMediaTime()
-			var cur = Metrics(total: m.totalNumberOfFrames, dropped: m.numberOfDroppedFrames, corrupted: m.numberOfCorruptedFrames, time: now)
+			var cur = Metrics(total: m.totalNumberOfFrames, dropped: m.numberOfDroppedFrames, corrupted: m.numberOfCorruptedFrames, time: now, delay: m.totalAccumulatedFrameDelay)
+			// Average lateness against PTS since the last poll -> presentation lead feedback.
+			var frameDelay: Double?
+			self.metricsLock.withLock {
+				if let l = self.lastDelaySample, cur.total > l.total {
+					frameDelay = max(0, (cur.delay - l.delay) / Double(cur.total - l.total))
+				}
+				self.lastDelaySample = (cur.total, cur.delay)
+			}
+			if let d = frameDelay { self.adjustLead(frameDelay: d, now: now) }
 			let result: (decoded: Int, dropped: Int, corrupted: Int, fps: Double?) = self.metricsLock.withLock {
 				if cur.total < self.baseline.total { self.baseline = Metrics() } // counters were reset
 				let base = self.baseline
@@ -157,7 +242,10 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 				}
 				return (decoded, cur.dropped, cur.corrupted, fps)
 			}
+			let leadMs = self.lock.withLock { self.lead } * 1000
 			self.stats.update { s in
+				s.presentationLeadMs = leadMs
+				if let d = frameDelay { s.layerFrameDelayMs = d * 1000 }
 				s.framesDecoded = result.decoded
 				s.layerDroppedFrames = result.dropped
 				s.layerCorruptedFrames = result.corrupted

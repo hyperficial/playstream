@@ -5,8 +5,19 @@ import os
 import PSContracts
 
 public struct AudioPipelineConfiguration: Sendable {
-	/// Mean amount of audio to keep buffered, in milliseconds. Playback starts once this much has arrived.
-	public var targetBufferMs: Double = 35
+	/// Mean amount of audio to keep buffered, in milliseconds. With `adaptive` on this is the floor the
+	/// adaptive target starts from and never goes below; with `adaptive` off it is the fixed (pinned) target.
+	public var targetBufferMs: Double = 40
+	/// Ceiling of the adaptive target.
+	public var maxTargetMs: Double = 200
+	/// Adapt the target to the gaps actually seen on the link. Off = pinned at `targetBufferMs`.
+	public var adaptive: Bool = true
+	/// Safety added on top of the longest recent inter-arrival gap.
+	public var gapMarginMs: Double = 15
+	/// How far back the longest gap is remembered, in seconds. The target only falls below it gradually.
+	public var gapWindowSeconds: Int = 30
+	/// How fast the target falls once the link is clean, in ms per second (never below the gap requirement).
+	public var decayMsPerSecond: Double = 2
 	/// When the buffer exceeds target + this, it jumps back to target with a short crossfade.
 	public var maxExcessMs: Double = 60
 	/// I/O buffer size requested from the output device, in frames (clamped to what the hardware allows).
@@ -20,7 +31,13 @@ public struct AudioPipelineConfiguration: Sendable {
 public struct AudioPipelineStats: Sendable {
 	/// Audio currently queued ahead of the render position.
 	public var bufferedMs: Double
+	/// The target fill in force right now (adaptive, between the configured floor and ceiling).
 	public var targetMs: Double
+	public var adaptiveTarget: Bool
+	/// Longest gap between two incoming chunks over the last 10 s.
+	public var longestGapMs: Double
+	/// 95th percentile of the per-second longest gap over the last 60 s.
+	public var gapPercentileMs: Double
 	/// False while priming / after an underrun (output is silent).
 	public var isPlaying: Bool
 	/// Times the buffer ran dry during playback.
@@ -69,10 +86,20 @@ public final class AudioPipeline: AudioStreamSink {
 	/// Set before the stream starts. The tap gets `pcmAudioDidConfigure` on the network thread before its first chunk.
 	public weak var pcmTap: PCMAudioTap?
 
-	/// Live-adjustable target buffer fill.
+	/// Floor of the adaptive target (or the pinned target when adaptive is off). Live-adjustable.
 	public var targetBufferMs: Double {
 		get { Double(core.targetMicros.load(ordering: .relaxed)) / 1000 }
 		set { core.targetMicros.store(Int(max(5, min(500, newValue)) * 1000), ordering: .relaxed) }
+	}
+	/// Ceiling of the adaptive target. Live-adjustable.
+	public var maxTargetMs: Double {
+		get { Double(core.maxTargetMicros.load(ordering: .relaxed)) / 1000 }
+		set { core.maxTargetMicros.store(Int(max(5, min(1000, newValue)) * 1000), ordering: .relaxed) }
+	}
+	/// Adaptive target on/off. Live-adjustable.
+	public var isAdaptive: Bool {
+		get { core.adaptive.load(ordering: .relaxed) }
+		set { core.adaptive.store(newValue, ordering: .relaxed) }
 	}
 
 	/// Diagnostic lines (device changes, rebuilds, failures). Called on an internal queue.
@@ -89,6 +116,7 @@ public final class AudioPipeline: AudioStreamSink {
 	private var tapNotifiedFor: ObjectIdentifier?
 	private var tapNotifiedFormat = (channels: 0, rate: 0)
 	private var configured = false
+	private let gaps = GapTracker()
 
 	// Control-queue state.
 	private var wanted = false
@@ -110,6 +138,12 @@ public final class AudioPipeline: AudioStreamSink {
 		self.configuration = configuration
 		core.targetMicros.store(Int(configuration.targetBufferMs * 1000), ordering: .relaxed)
 		core.maxExcessMicros.store(Int(configuration.maxExcessMs * 1000), ordering: .relaxed)
+		core.maxTargetMicros.store(Int(max(configuration.maxTargetMs, configuration.targetBufferMs) * 1000), ordering: .relaxed)
+		core.adaptive.store(configuration.adaptive, ordering: .relaxed)
+		core.decayMicrosPerSec.store(Int(configuration.decayMsPerSecond * 1000), ordering: .relaxed)
+		core.curTargetMicros.store(Int(configuration.targetBufferMs * 1000), ordering: .relaxed)
+		gaps.marginMs = configuration.gapMarginMs
+		gaps.windowSeconds = max(1, min(60, configuration.gapWindowSeconds))
 	}
 
 	deinit {
@@ -132,7 +166,10 @@ public final class AudioPipeline: AudioStreamSink {
 		let outLat = facts.sampleRate > 0 ? Double(facts.latencyFrames) / facts.sampleRate * 1000 : 0
 		return AudioPipelineStats(
 			bufferedMs: buffered,
-			targetMs: targetBufferMs,
+			targetMs: Double(core.curTargetMicros.load(ordering: .relaxed)) / 1000,
+			adaptiveTarget: core.adaptive.load(ordering: .relaxed),
+			longestGapMs: Double(core.longestGapMicros.load(ordering: .relaxed)) / 1000,
+			gapPercentileMs: Double(core.gapPctMicros.load(ordering: .relaxed)) / 1000,
 			isPlaying: core.playingFlag.load(ordering: .relaxed),
 			underruns: core.underruns.load(ordering: .relaxed),
 			overruns: core.overruns.load(ordering: .relaxed),
@@ -155,6 +192,7 @@ public final class AudioPipeline: AudioStreamSink {
 		let rate = max(8000, min(192_000, sampleRate))
 		self.channels = ch
 		configured = true
+		gaps.reset(core)
 		control.sync {
 			let changed = core.srcRate.load(ordering: .relaxed) != rate
 			if wanted && !changed && unit != nil { return }
@@ -172,6 +210,15 @@ public final class AudioPipeline: AudioStreamSink {
 
 	public func audioStreamDidReceive(pcm: UnsafeBufferPointer<Int16>, frameCount: Int) {
 		let arrival = mach_absolute_time()
+		receive(pcm: pcm, frameCount: frameCount, hostTime: arrival, seconds: Self.seconds(arrival))
+	}
+
+	/// Headless tests: deliver a chunk with a simulated arrival time (seconds on any monotonic clock).
+	public func audioStreamDidReceive(pcm: UnsafeBufferPointer<Int16>, frameCount: Int, simulatedArrivalSeconds: Double) {
+		receive(pcm: pcm, frameCount: frameCount, hostTime: 0, seconds: simulatedArrivalSeconds)
+	}
+
+	private func receive(pcm: UnsafeBufferPointer<Int16>, frameCount: Int, hostTime arrival: UInt64, seconds: Double) {
 		guard frameCount > 0 else { return }
 		let ch = pcm.count / frameCount
 		guard ch > 0 else { return }
@@ -185,9 +232,19 @@ public final class AudioPipeline: AudioStreamSink {
 			}
 			tap.pcmAudioDidReceive(pcm: pcm, frameCount: frameCount, hostTime: arrival)
 		}
+		gaps.note(seconds, core: core)
 		if core.active.load(ordering: .acquiring) {
 			_ = core.write(pcm, frames: frameCount, channels: channels)
 		}
+	}
+
+	private static let timebase: mach_timebase_info_data_t = {
+		var tb = mach_timebase_info_data_t()
+		mach_timebase_info(&tb)
+		return tb
+	}()
+	private static func seconds(_ machTime: UInt64) -> Double {
+		Double(machTime) * Double(timebase.numer) / Double(timebase.denom) / 1e9
 	}
 
 	public func audioStreamDidStop() {

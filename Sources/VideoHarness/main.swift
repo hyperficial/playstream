@@ -6,6 +6,11 @@
 //                    [--window] [--seconds 5] [--drop-at 200 --drop-count 5] [--corrupt-at 300]
 //                    [--switch-mode-at 400] [--screenshot out.png] [--inline-ps] [--trailing-zeros]
 //                    [--no-console-recovery] [--loop]
+//   pacing / network: [--pacing off|adaptive] [--min-delay-ms 16.7] [--max-delay-ms 50]
+//                    [--pattern steady|jitter|stall|mixed] [--jitter-ms 4] [--stall-every-ms 500]
+//                    [--stall-min-ms 60] [--stall-max-ms 115] [--mixed-from 5 --mixed-to 12]
+//                    [--send-fps 30] [--seed 1] [--switch-pacing-at SECONDS]
+// --window / --fullscreen only open a window with PSVIDEO_ALLOW_WINDOW=1 (it never activates the app).
 
 import AppKit
 import CoreMedia
@@ -40,6 +45,19 @@ struct Options {
 	/// Second elementary stream; when the first runs out, its header is sent as a separate buffer
 	/// (like the core does on an adaptive profile switch) and its frames follow.
 	var thenFile: String?
+	var pacing: VideoPacingMode = .adaptive
+	var minDelayMs: Double?
+	var maxDelayMs: Double?
+	var pattern = "steady"
+	var jitterMs = 4.0
+	var stallEveryMs = 500.0
+	var stallMinMs = 60.0
+	var stallMaxMs = 115.0
+	var mixedFrom = 5.0
+	var mixedTo = 12.0
+	var sendFPS: Double?
+	var seed: UInt64 = 1
+	var switchPacingAt: Double?
 }
 
 var opt = Options()
@@ -76,6 +94,19 @@ while !args.isEmpty {
 	case "--quiet": opt.quiet = true
 	case "--dump": opt.dumpDir = next()
 	case "--then": opt.thenFile = next()
+	case "--pacing": opt.pacing = next() == "off" ? .off : .adaptive
+	case "--min-delay-ms": opt.minDelayMs = Double(next())
+	case "--max-delay-ms": opt.maxDelayMs = Double(next())
+	case "--pattern": opt.pattern = next()
+	case "--jitter-ms": opt.jitterMs = Double(next()) ?? 4
+	case "--stall-every-ms": opt.stallEveryMs = Double(next()) ?? 500
+	case "--stall-min-ms": opt.stallMinMs = Double(next()) ?? 60
+	case "--stall-max-ms": opt.stallMaxMs = Double(next()) ?? 115
+	case "--mixed-from": opt.mixedFrom = Double(next()) ?? 5
+	case "--mixed-to": opt.mixedTo = Double(next()) ?? 12
+	case "--send-fps": opt.sendFPS = Double(next())
+	case "--seed": opt.seed = UInt64(next()) ?? 1
+	case "--switch-pacing-at": opt.switchPacingAt = Double(next())
 	default:
 		print("unknown option \(a)")
 		exit(2)
@@ -228,10 +259,18 @@ log("loaded \(opt.file): header \(header.count) B, \(frames.count) frames, keyfr
 
 // MARK: - Pipeline
 
+// On-screen windows steal focus from whoever is using this Mac, so they need an explicit opt-in.
+if opt.window && ProcessInfo.processInfo.environment["PSVIDEO_ALLOW_WINDOW"] != "1" {
+	print("--window/--fullscreen disabled: set PSVIDEO_ALLOW_WINDOW=1 to open an on-screen window. Running headless.")
+	opt.window = false
+	opt.fullscreen = false
+}
 let app = NSApplication.shared
-app.setActivationPolicy(opt.window ? .regular : .prohibited)
+app.setActivationPolicy(opt.window ? .accessory : .prohibited)
 
-let pipeline = VideoPipeline(displayMode: opt.mode)
+let pipeline = VideoPipeline(displayMode: opt.mode, pacingMode: opt.pacing)
+if let v = opt.minDelayMs { pipeline.minimumPlayoutDelayMs = v }
+if let v = opt.maxDelayMs { pipeline.maximumPlayoutDelayMs = v }
 let console = SimulatedConsole()
 let tap = TapCounter()
 pipeline.keyframeRequester = console
@@ -244,11 +283,114 @@ if opt.window {
 	w.title = "ps-video-harness \(opt.mode.rawValue) \(opt.file.split(separator: "/").last ?? "")"
 	w.contentView = view
 	w.collectionBehavior = [.fullScreenPrimary]
-	w.makeKeyAndOrderFront(nil)
-	app.activate(ignoringOtherApps: true)
+	w.orderFrontRegardless() // shown, but never made key and the app is never activated
 	window = w
 	if opt.fullscreen { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { w.toggleFullScreen(nil) } }
 }
+
+// MARK: - Network arrival patterns
+
+/// Deterministic PRNG so runs are repeatable.
+struct SplitMix: RandomNumberGenerator {
+	var state: UInt64
+	mutating func next() -> UInt64 {
+		state &+= 0x9E37_79B9_7F4A_7C15
+		var z = state
+		z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE5_E9B9
+		z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+		return z ^ (z >> 31)
+	}
+}
+
+/// Arrival time (seconds after stream start) of frame `i`, sent by the console every 1/fps.
+/// - steady: exactly on time.
+/// - jitter: each frame delayed by a random 0...jitterMs (plus 0.3 ms base noise), order kept.
+/// - stall: Wi-Fi off-channel stall of stallMin...stallMax ms roughly every stallEvery ms; frames
+///   produced during the stall all arrive together when it ends (0.15 ms apart).
+/// - mixed: steady (0.3 ms noise) before mixedFrom and after mixedTo seconds, stall pattern between.
+final class ArrivalModel {
+	private var rng: SplitMix
+	private var stalls: [(start: Double, end: Double)] = []
+	private var last = 0.0
+	let interval: Double
+
+	init(seed: UInt64, interval: Double) {
+		rng = SplitMix(state: seed)
+		self.interval = interval
+		if opt.pattern == "stall" || opt.pattern == "mixed" {
+			var t = opt.pattern == "mixed" ? opt.mixedFrom : 0.4
+			let end = opt.pattern == "mixed" ? opt.mixedTo : opt.seconds + 1
+			while t < end {
+				let len = uniform(opt.stallMinMs, opt.stallMaxMs) / 1000
+				stalls.append((t, t + len))
+				t += uniform(opt.stallEveryMs * 0.8, opt.stallEveryMs * 1.2) / 1000
+			}
+		}
+	}
+
+	private func uniform(_ a: Double, _ b: Double) -> Double { a + (b - a) * Double.random(in: 0..<1, using: &rng) }
+
+	func arrival(_ i: Int) -> Double {
+		let ideal = Double(i) * interval
+		var t = ideal + uniform(0, 0.0003)
+		if opt.pattern == "jitter" { t += uniform(0, opt.jitterMs / 1000) }
+		if let s = stalls.first(where: { ideal >= $0.start && ideal < $0.end }) {
+			t = max(t, s.end) // held by the stalled radio, then delivered in one burst
+		}
+		t = max(t, last + 0.00015)
+		last = t
+		return t
+	}
+}
+
+// MARK: - On-screen measurement
+
+/// Presentation events: (on-screen time, arrival time or nan) in host seconds.
+final class PresentLog {
+	private let lock = NSLock()
+	private(set) var events: [(shown: Double, arrival: Double)] = []
+	func add(_ shown: Double, _ arrival: Double) {
+		lock.lock(); events.append((shown, arrival)); lock.unlock()
+	}
+	func snapshot() -> [(shown: Double, arrival: Double)] {
+		lock.lock(); defer { lock.unlock() }; return events
+	}
+}
+let presentLog = PresentLog()
+
+/// Pacer decisions: (arrival, target or nan when pacing is off, skipped).
+final class ScheduleLog {
+	private let lock = NSLock()
+	private(set) var events: [(arrival: Double, target: Double, skip: Bool)] = []
+	func add(_ a: Double, _ t: Double, _ s: Bool) { lock.lock(); events.append((a, t, s)); lock.unlock() }
+	func snapshot() -> [(arrival: Double, target: Double, skip: Bool)] { lock.lock(); defer { lock.unlock() }; return events }
+}
+let scheduleLog = ScheduleLog()
+var arrivalLogLock = NSLock()
+
+/// Layer path: the layer reports nothing about presentation, so poll the displayed pixel buffer once
+/// per display refresh and note when it changes (resolution: one refresh).
+final class LayerPoller: NSObject {
+	var link: CADisplayLink?
+	weak var last: CVPixelBuffer?
+	var lastID: ObjectIdentifier?
+	func start(in view: NSView) {
+		let l = view.displayLink(target: self, selector: #selector(tick(_:)))
+		let hz = Float(view.window?.screen?.maximumFramesPerSecond ?? 120)
+		l.preferredFrameRateRange = CAFrameRateRange(minimum: hz, maximum: hz, preferred: hz)
+		l.add(to: .main, forMode: .common)
+		link = l
+	}
+	@objc func tick(_ l: CADisplayLink) {
+		guard let pb = pipeline.copyLastDecodedPixelBuffer() else { return }
+		let id = ObjectIdentifier(pb)
+		if id != lastID {
+			lastID = id
+			presentLog.add(l.timestamp, .nan)
+		}
+	}
+}
+let layerPoller = LayerPoller()
 
 // MARK: - Feeder thread
 
@@ -259,6 +401,7 @@ final class FeedResult {
 	var done = false
 }
 let result = FeedResult()
+var streamStartHost = 0.0
 let resultLock = NSLock()
 
 let feeder = Thread {
@@ -279,17 +422,19 @@ let feeder = Thread {
 
 	var tb = mach_timebase_info_data_t()
 	mach_timebase_info(&tb)
-	let periodTicks = UInt64(1_000_000_000 / Double(opt.fps) * Double(tb.denom) / Double(tb.numer))
-	var nextTick = mach_absolute_time()
-	let totalTicks = Int(opt.seconds * Double(opt.fps))
+	let sendFPS = opt.sendFPS ?? Double(opt.fps)
+	let model = ArrivalModel(seed: opt.seed, interval: 1 / sendFPS)
+	let streamStart = mach_absolute_time() + UInt64(0.05 * 1e9 * Double(tb.denom) / Double(tb.numer))
+	streamStartHost = Double(streamStart) * Double(tb.numer) / Double(tb.denom) / 1e9
+	let totalTicks = Int(opt.seconds * sendFPS)
 	var src = 0 // index into frames
 	var lostPending = 0
 	var failedSince: Int?
 	var switched = false
 
 	for tick in 0..<totalTicks {
-		mach_wait_until(nextTick)
-		nextTick += periodTicks
+		let at = model.arrival(tick)
+		mach_wait_until(streamStart + UInt64(at * 1e9 * Double(tb.denom) / Double(tb.numer)))
 		if src >= frames.count {
 			if let s2 = second {
 				second = nil
@@ -382,6 +527,127 @@ func describe(_ s: VideoStats) -> String {
 	return parts.joined(separator: " ")
 }
 
+func describePacing(_ s: VideoStats) -> String {
+	var t = String(format: "pacing=%@ fps=%.0f jitter=%.2f/p95 %.2fms maxgap=%.1fms delay=%.1fms (target %.1f) late=%d skipped=%d dropped=%d",
+		s.pacingMode.rawValue, s.streamFPS, s.arrivalJitterAvgMs, s.arrivalJitterP95Ms, s.arrivalMaxGapMs, s.playoutDelayMs, s.playoutTargetDelayMs, s.framesLate, s.framesSkipped, s.framesDropped)
+	if let g = s.glassAvgMs { t += String(format: " glass=%.1fms", g) }
+	if let a = s.presentedIntervalAvgMs, let m = s.presentedIntervalMaxMs { t += String(format: " shown-interval=%.1f/max %.1fms offCadence=%d", a, m, s.presentedOffCadence) }
+	if let hz = s.displayRefreshHz { t += String(format: " refresh=%.0fHz", hz) }
+	t += String(format: " lead=%.1fms", s.presentationLeadMs)
+	if let d = s.layerFrameDelayMs { t += String(format: " layerFrameDelay=%.2fms", d) }
+	return t
+}
+
+/// Distribution of on-screen frame intervals (in display refreshes) and arrival-to-glass latency,
+/// split into phases by stream time.
+func summarizePresentation() {
+	let ev = presentLog.snapshot()
+	guard ev.count > 2 else {
+		log("presentation: no on-screen events recorded (headless? layer path needs --window)")
+		return
+	}
+	let refresh = 1.0 / Double(window?.screen?.maximumFramesPerSecond ?? 120)
+	let source = opt.mode == .metal ? "Metal drawable presentedTime" : "layer: displayed-buffer poll at display refresh (±1 refresh)"
+	var phases: [(String, Double, Double)] = [("all", -1, 1e9)]
+	if opt.pattern == "mixed" {
+		phases = [("clean-before", 1.0, opt.mixedFrom), ("bursty", opt.mixedFrom, opt.mixedTo), ("clean-after", opt.mixedTo, 1e9), ("clean-after +5s", opt.mixedTo + 5, 1e9)]
+	} else {
+		phases = [("all (after 1 s warm-up)", 1.0, 1e9)]
+	}
+	log("presentation (\(source)), refresh \(String(format: "%.2f", refresh * 1000)) ms:")
+	for (name, from, to) in phases {
+		var hist = [Int](repeating: 0, count: 7) // 0..5 refreshes, 6 = 6+
+		var intervals: [Double] = []
+		var lat: [Double] = []
+		for i in 1..<ev.count {
+			let t = ev[i].shown - streamStartHost
+			guard t >= from && t < to else { continue }
+			let dt = ev[i].shown - ev[i - 1].shown
+			intervals.append(dt * 1000)
+			hist[min(6, Int((dt / refresh).rounded()))] += 1
+			if !ev[i].arrival.isNaN { lat.append((ev[i].shown - ev[i].arrival) * 1000) }
+		}
+		guard !intervals.isEmpty else { continue }
+		intervals.sort()
+		lat.sort()
+		let n = Double(intervals.count)
+		let histText = (0...6).filter { hist[$0] > 0 }.map { "\($0 == 6 ? "6+" : "\($0)"):\(String(format: "%.1f%%", Double(hist[$0]) * 100 / n))" }.joined(separator: " ")
+		var line = String(format: "  %@: %d intervals, p50 %.1f p95 %.1f max %.1f ms; refreshes per frame { %@ }",
+			name, intervals.count, intervals[intervals.count / 2], intervals[Int(n * 0.95) - (Int(n * 0.95) >= intervals.count ? 1 : 0)], intervals.last!, histText)
+		if !lat.isEmpty {
+			line += String(format: "; arrival->glass avg %.1f p95 %.1f max %.1f ms", lat.reduce(0, +) / Double(lat.count), lat[min(lat.count - 1, Int(Double(lat.count) * 0.95))], lat.last!)
+		}
+		log(line)
+	}
+}
+
+/// Planned presentation, headless: each shown frame's target (or its arrival when pacing is off)
+/// snapped to the display's vsync grid. This is what reaches the glass if the system honours the
+/// presentation times (the renderer adds a constant presentation lead on top, which the immediate path
+/// pays too, so it is left out of the latency figure).
+func summarizeSchedule() {
+	let ev = scheduleLog.snapshot()
+	guard ev.count > 10 else { return }
+	let refresh = 1.0 / Double(NSScreen.main?.maximumFramesPerSecond ?? 120)
+	let minDelay = pipeline.minimumPlayoutDelayMs
+	var phases: [(String, Double, Double)]
+	if opt.pattern == "mixed" {
+		phases = [("clean-before", 1.0, opt.mixedFrom), ("bursty", opt.mixedFrom, opt.mixedTo), ("clean-after", opt.mixedTo, opt.mixedTo + 5), ("clean-after +5s", opt.mixedTo + 5, 1e9)]
+	} else {
+		phases = [("all (after 1 s warm-up)", 1.0, 1e9)]
+	}
+	log(String(format: "planned on-screen cadence (vsync grid %.2f ms, pacing %@):", refresh * 1000, pipeline.pacingMode.rawValue))
+	for (name, from, to) in phases {
+		var hist = [Int](repeating: 0, count: 8)
+		var lat: [Double] = []
+		var coalesced = 0, skipped = 0, n = 0
+		var prevSlot: Int?
+		for e in ev {
+			let t = e.arrival - streamStartHost
+			guard t >= from && t < to else { continue }
+			if e.skip { skipped += 1; continue }
+			let shownAt = e.target.isNaN ? e.arrival : e.target
+			lat.append((shownAt - e.arrival) * 1000)
+			let slot = Int((shownAt / refresh).rounded(.up))
+			if let p = prevSlot {
+				let d = slot - p
+				if d <= 0 { coalesced += 1; continue } // replaced before it reached the glass
+				hist[min(7, d)] += 1
+				n += 1
+			}
+			prevSlot = max(slot, prevSlot ?? slot)
+		}
+		guard n > 0 else { continue }
+		lat.sort()
+		let histText = (1...7).filter { hist[$0] > 0 }.map { "\($0 == 7 ? "7+" : "\($0)"):\(String(format: "%.1f%%", Double(hist[$0]) * 100 / Double(n)))" }.joined(separator: " ")
+		log(String(format: "  %@: %d frames; refreshes per frame { %@ }; never shown (2 in one vsync) %d, skipped %d; added delay avg %.1f p95 %.1f max %.1f ms",
+			name, n, histText, coalesced, skipped, lat.reduce(0, +) / Double(lat.count), lat[min(lat.count - 1, Int(Double(lat.count) * 0.95))], lat.last!))
+	}
+	// Added delay per second of stream time (avg/max), to see adaptation and recovery.
+	var series: [String] = []
+	var sec = 0
+	while true {
+		let xs = ev.filter { !$0.target.isNaN && !$0.skip && Int($0.arrival - streamStartHost) == sec }.map { ($0.target - $0.arrival) * 1000 }
+		if xs.isEmpty { if sec > Int(opt.seconds) + 1 { break } else { sec += 1; continue } }
+		series.append(String(format: "%d:%.0f/%.0f", sec, xs.reduce(0, +) / Double(xs.count), xs.max()!))
+		sec += 1
+	}
+	if !series.isEmpty { log("  added delay per second (s:avg/max ms): " + series.joined(separator: " ")) }
+	if opt.pattern == "mixed" && pipeline.pacingMode == .adaptive {
+		// When does the delay come back to the minimum after the link recovers?
+		var recovered: Double?
+		for e in ev where !e.target.isNaN && e.arrival - streamStartHost >= opt.mixedTo {
+			let d = (e.target - e.arrival) * 1000
+			if d <= minDelay + 1.5 { if recovered == nil { recovered = e.arrival - streamStartHost } } else { recovered = nil }
+		}
+		if let r = recovered {
+			log(String(format: "  delay back at the minimum (%.1f ms) %.1f s after the link recovered, and stayed there", minDelay, r - opt.mixedTo))
+		} else {
+			log("  delay did NOT return to the minimum before the end of the run")
+		}
+	}
+}
+
 func describePixelBuffer(_ pb: CVPixelBuffer) -> String {
 	let fmt = CVPixelBufferGetPixelFormatType(pb)
 	let fcc = String(bytes: [24, 16, 8, 0].map { UInt8((fmt >> $0) & 0xFF) }, encoding: .ascii) ?? "\(fmt)"
@@ -449,6 +715,17 @@ func verifyAndDump(_ pb: CVPixelBuffer, dir: String) {
 
 // MARK: - Run
 
+pipeline.presentedObserver = { shown, arrival in presentLog.add(shown, arrival) }
+pipeline.scheduleObserver = { a, t, s in scheduleLog.add(a, t, s) }
+if opt.window && opt.mode == .sampleBufferLayer {
+	DispatchQueue.main.async { layerPoller.start(in: view) }
+}
+if let t = opt.switchPacingAt {
+	DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+		pipeline.pacingMode = pipeline.pacingMode == .off ? .adaptive : .off
+		log("pacing switched to \(pipeline.pacingMode.rawValue)")
+	}
+}
 feeder.start()
 var lastPrint = CACurrentMediaTime()
 var shotTaken = false
@@ -463,6 +740,7 @@ while Date() < deadline {
 	if now - lastPrint >= 1 {
 		lastPrint = now
 		if !opt.quiet { log(describe(pipeline.stats)) }
+		if opt.quiet && opt.pattern != "none" { log(describePacing(pipeline.stats)) }
 	}
 	if let path = opt.screenshot, !shotTaken, let w = window, now - startTime >= (opt.screenshotAt ?? min(opt.seconds * 0.6, 3)) {
 		shotTaken = true
@@ -492,6 +770,9 @@ if let dir = opt.dumpDir, let pb = pipeline.copyLastDecodedPixelBuffer() {
 	try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
 	verifyAndDump(pb, dir: dir)
 }
+summarizePresentation()
+summarizeSchedule()
+log("PACING " + describePacing(final))
 pipeline.videoStreamDidStop()
 log("FINAL \(describe(final))")
 log("tap: samples=\(tap.samples) keyframes=\(tap.keyframes) nonMonotonicPTS=\(tap.nonMonotonic) colour=\(tap.colorTags) paramSetsInFormatDesc=\(tap.hasParamSets)")

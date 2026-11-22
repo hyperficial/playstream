@@ -18,6 +18,15 @@ struct RenderState {
 	var gain: Float = 0
 	var lastL: Float = 0
 	var lastR: Float = 0
+	/// Current (adaptive) target fill in source frames; 0 until first render.
+	var target = 0.0
+	/// Set by an underrun: resume early (the backlog usually arrives in one burst) instead of priming to the full target.
+	var resuming = false
+	/// Frames left before another underrun may raise the target.
+	var bumpCooldown = 0
+	/// Near-underrun tracking over ~1 s windows.
+	var minFill = Int.max
+	var tickFrames = 0
 }
 
 /// Lock-free single-producer / single-consumer ring of stereo float frames plus the render
@@ -40,7 +49,17 @@ final class AudioRenderCore {
 
 	// Configuration (control side writes, render reads).
 	let srcRate = Atomic<Int>(48000)
-	let targetMicros = Atomic<Int>(35_000)
+	/// Floor of the adaptive target (the pinned target when adaptive is off).
+	let targetMicros = Atomic<Int>(40_000)
+	let maxTargetMicros = Atomic<Int>(200_000)
+	let adaptive = Atomic<Bool>(true)
+	let decayMicrosPerSec = Atomic<Int>(2_000)
+	/// Fill needed to ride out the gaps seen recently (longest gap in window + margin). Written by the producer.
+	let needMicros = Atomic<Int>(0)
+	let longestGapMicros = Atomic<Int>(0)
+	let gapPctMicros = Atomic<Int>(0)
+	/// The target currently in force, for stats.
+	let curTargetMicros = Atomic<Int>(40_000)
 	let maxExcessMicros = Atomic<Int>(60_000)
 	let volumeBits = Atomic<UInt32>(Float(1).bitPattern)
 	let muted = Atomic<Bool>(false)
@@ -132,29 +151,63 @@ final class AudioRenderCore {
 		let s = state
 		let rate = Double(srcRate.load(ordering: .relaxed))
 		let framesPerMs = rate / 1000.0
-		let target = Int(Double(targetMicros.load(ordering: .relaxed)) / 1000.0 * framesPerMs)
+		let dt = Double(frames) / rate
 		let maxExcess = Int(Double(maxExcessMicros.load(ordering: .relaxed)) / 1000.0 * framesPerMs)
 		let w = writeIdx.load(ordering: .acquiring)
 		var r = s.pointee.readIdx
 		let fill = w - r
 		let gTarget = currentGainTarget()
 
+		// Adaptive target: jumps up to what the observed gaps need, decays slowly, never below the floor.
+		let minT = Double(targetMicros.load(ordering: .relaxed)) / 1000.0 * framesPerMs
+		let maxT = max(minT, Double(maxTargetMicros.load(ordering: .relaxed)) / 1000.0 * framesPerMs)
+		let need = Double(needMicros.load(ordering: .relaxed)) / 1000.0 * framesPerMs
+		var tgt = s.pointee.target > 0 ? s.pointee.target : minT
+		if adaptive.load(ordering: .relaxed) {
+			let decay = Double(decayMicrosPerSec.load(ordering: .relaxed)) / 1000.0 * framesPerMs * dt
+			tgt = max(tgt - decay, need)
+		} else {
+			tgt = minT
+		}
+		tgt = max(minT, min(maxT, tgt))
+		s.pointee.bumpCooldown -= frames
+
 		if !s.pointee.playing {
-			if fill >= max(target, frames * 2 + 2) {
+			// First start: prime to the target. After an underrun the backlog usually lands in one burst,
+			// so resume as soon as a modest amount is there and let the target protect the next stall.
+			let resumeFrames = max(min(tgt * 0.5, 60 * framesPerMs), 20 * framesPerMs)
+			let need0 = s.pointee.resuming ? resumeFrames : tgt
+			if fill >= Int(max(need0, Double(frames * 2 + 2))) {
 				s.pointee.playing = true
+				s.pointee.resuming = false
 				s.pointee.ema = Double(fill)
-				s.pointee.ratioAdj = 0
 				s.pointee.frac = 0
 				s.pointee.xfRemaining = 0
 				s.pointee.ramp = 0
 				s.pointee.gain = gTarget
+				s.pointee.minFill = Int.max
+				s.pointee.tickFrames = 0
 				playingFlag.store(true, ordering: .relaxed)
 			} else {
 				for i in 0..<(frames * 2) { out[i] = 0 }
 				s.pointee.lastL = 0
 				s.pointee.lastR = 0
+				s.pointee.target = tgt
+				curTargetMicros.store(Int(tgt / framesPerMs * 1000), ordering: .relaxed)
 				return
 			}
+		}
+		let target = Int(tgt)
+
+		// Near-underrun feedback: if the fill kept dipping close to empty during the last second, nudge the target up.
+		s.pointee.minFill = min(s.pointee.minFill, fill)
+		s.pointee.tickFrames += frames
+		if Double(s.pointee.tickFrames) >= rate {
+			if adaptive.load(ordering: .relaxed), Double(s.pointee.minFill) < 10 * framesPerMs {
+				tgt = min(maxT, min(tgt + 5 * framesPerMs, max(tgt, need + 40 * framesPerMs)))
+			}
+			s.pointee.minFill = Int.max
+			s.pointee.tickFrames = 0
 		}
 
 		// Drift controller: slow low-pass of the fill level drives a small playback-rate trim.
@@ -172,9 +225,13 @@ final class AudioRenderCore {
 		let errMs = (ema - Double(target)) / framesPerMs
 		let deadband = 2.0
 		let eff = errMs > deadband ? errMs - deadband : (errMs < -deadband ? errMs + deadband : 0)
-		let trim = max(-0.003, min(0.003, s.pointee.trim + 0.00004 * eff * Double(frames) / rate))
+		let trim = max(-0.003, min(0.003, s.pointee.trim + 0.00004 * eff * dt))
 		s.pointee.trim = trim
-		let adj = max(-0.015, min(0.015, eff * 0.0005 + trim))
+		// Too full: speed up gently (max +1.5 %). Too empty: stretch harder (max -4 %) to refill quickly.
+		let desired = max(-0.04, min(0.015, (eff > 0 ? eff * 0.0005 : eff * 0.001) + trim))
+		// Slew-limited so a target change never steps the playback rate abruptly.
+		let step = 0.04 * dt
+		let adj = s.pointee.ratioAdj + max(-step, min(step, desired - s.pointee.ratioAdj))
 		s.pointee.ratioAdj = adj
 		adjPPM.store(Int(adj * 1e6), ordering: .relaxed)
 		let ratio = 1.0 + adj
@@ -199,6 +256,12 @@ final class AudioRenderCore {
 				// Starved: fade out from the last sample, output silence, go back to priming.
 				underruns.wrappingAdd(1, ordering: .relaxed)
 				s.pointee.playing = false
+				s.pointee.resuming = true
+				if adaptive.load(ordering: .relaxed), s.pointee.bumpCooldown <= 0 {
+					// Raise the target a little, but never far above what the measured gaps justify.
+					tgt = min(maxT, min(tgt + 10 * framesPerMs, max(tgt, need + 40 * framesPerMs)))
+					s.pointee.bumpCooldown = Int(rate)
+				}
 				playingFlag.store(false, ordering: .relaxed)
 				xf = 0
 				let fadeFrames = min(frames - i, 64)
@@ -248,6 +311,8 @@ final class AudioRenderCore {
 			i += 1
 		}
 
+		s.pointee.target = tgt
+		curTargetMicros.store(Int(tgt / framesPerMs * 1000), ordering: .relaxed)
 		s.pointee.readIdx = r
 		s.pointee.frac = frac
 		s.pointee.gain = g

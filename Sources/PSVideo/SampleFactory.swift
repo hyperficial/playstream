@@ -71,8 +71,6 @@ final class SampleFactory {
 			let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
 			let yes = Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
 			let no = Unmanaged.passUnretained(kCFBooleanFalse).toOpaque()
-			// Shown as soon as decoded, regardless of any timebase (the display layer has none).
-			CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(), yes)
 			CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(), isKeyframe ? no : yes)
 			CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DependsOnOthers).toOpaque(), isKeyframe ? no : yes)
 		}

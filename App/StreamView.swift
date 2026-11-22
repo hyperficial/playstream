@@ -1,4 +1,5 @@
 import PSContracts
+import PSInput
 import PSRecording
 import PSVideo
 import SwiftUI
@@ -7,15 +8,18 @@ struct StreamView: View {
 	@ObservedObject var controller: StreamController
 	@ObservedObject var settings: AppSettings
 	@ObservedObject var recorder: StreamRecorder
+	let input: ControllerInput
 	let onDisconnect: () -> Void
 
 	@State private var showControls = false
+	@State private var showSettings = false
 	@State private var hideTask: Task<Void, Never>?
 	@State private var pin = ""
 
-	init(controller: StreamController, settings: AppSettings, onDisconnect: @escaping () -> Void) {
+	init(controller: StreamController, settings: AppSettings, input: ControllerInput, onDisconnect: @escaping () -> Void) {
 		self.controller = controller
 		self.settings = settings
+		self.input = input
 		self.recorder = controller.recorder
 		self.onDisconnect = onDisconnect
 	}
@@ -94,6 +98,16 @@ struct StreamView: View {
 			}
 			.help("Full screen (⌃⌘F)")
 
+			Button {
+				showSettings.toggle()
+			} label: {
+				Label("Settings", systemImage: "slider.horizontal.3")
+			}
+			.help("Controller and stream settings")
+			.popover(isPresented: $showSettings, arrowEdge: .top) {
+				SettingsView(settings: settings, input: input)
+			}
+
 			Divider().frame(height: 18)
 
 			Image(systemName: "speaker.wave.2.fill").foregroundStyle(.secondary)
@@ -151,7 +165,7 @@ struct StreamView: View {
 		hideTask?.cancel()
 		hideTask = Task {
 			try? await Task.sleep(nanoseconds: 2_500_000_000)
-			guard !Task.isCancelled else { return }
+			guard !Task.isCancelled, !showSettings else { return }
 			showControls = false
 			NSCursor.setHiddenUntilMouseMoves(true)
 		}
@@ -196,12 +210,14 @@ private struct StatsOverlay: View {
 			if let decode = stats.video.decodeTimeAvgMs {
 				row("Decode", String(format: "%.1f ms", decode))
 			}
-			row("Hand-off", String(format: "%.1f ms (max %.1f)", stats.video.handoffAvgMs, stats.video.handoffMaxMs))
+			row("Arrival", String(format: "jitter %.1f ms  longest gap %.0f ms", stats.video.arrivalJitterP95Ms, stats.video.arrivalMaxGapMs))
+			row("Pacing", stats.video.pacingMode == .off ? "off" : String(format: "delay %.0f ms  late %d  skipped %d", stats.video.playoutDelayMs, stats.video.framesLate, stats.video.framesSkipped))
 			if let glass = stats.video.glassAvgMs {
 				row("To glass", String(format: "%.1f ms", glass))
 			}
 			if let audio = stats.audio {
-				row("Audio", String(format: "buffer %.0f ms  out %.0f ms  underruns %d", audio.bufferedMs, audio.outputLatencyMs, audio.underruns))
+				row("Audio", String(format: "buffer %.0f/%.0f ms  out %.0f ms  underruns %d", audio.bufferedMs, audio.targetMs, audio.outputLatencyMs, audio.underruns))
+				row("Link gaps", String(format: "longest %.0f ms in the last 10 s", audio.longestGapMs))
 			}
 		}
 		.font(.caption.monospacedDigit())

@@ -27,8 +27,17 @@ final class AppSettings: ObservableObject {
 	@AppStorage("stream.codec") var codecRaw: Int = VideoCodec.hevcHDR.rawValue
 	@AppStorage("stream.dualsense") var dualSenseFeatures: Bool = true
 	@AppStorage("stream.hapticsAsRumble") var hapticsAsRumble: Bool = true
+	/// 0 (off) ... 1 (full). Applies live.
+	@AppStorage("controller.lightBrightness") var lightBrightness: Double = 0.4
+	@AppStorage("controller.playerLEDs") var playerLEDs: Bool = true
+	/// 0 (off) ... 1 (as the game asks). Applies live.
+	@AppStorage("controller.rumbleStrength") var rumbleStrength: Double = 1.0
+	@AppStorage("controller.motion") var motionSensors: Bool = true
+	@AppStorage("controller.keyboard") var keyboardFallback: Bool = true
 	@AppStorage("stream.showStats") var showStats: Bool = false
 	@AppStorage("stream.lowLatencyRenderer") var lowLatencyRenderer: Bool = false
+	/// Show frames on a steady cadence (about one frame of delay) instead of the instant they arrive. Applies live.
+	@AppStorage("stream.framePacing") var framePacing: Bool = true
 	@AppStorage("audio.volume") var volume: Double = 1.0
 	@AppStorage("stream.startFullscreen") var startFullscreen: Bool = true
 

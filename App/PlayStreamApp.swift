@@ -24,7 +24,7 @@ struct RootView: View {
 	var body: some View {
 		Group {
 			if let stream = model.stream {
-				StreamView(controller: stream, settings: model.settings, onDisconnect: { model.disconnect() })
+				StreamView(controller: stream, settings: model.settings, input: model.input, onDisconnect: { model.disconnect() })
 					.frame(minWidth: 640, minHeight: 360)
 			} else {
 				HomeView(model: model, discovery: model.discovery, store: model.store)

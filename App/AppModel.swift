@@ -40,6 +40,22 @@ final class AppModel: ObservableObject {
 		discovery.start()
 		input.start()
 		input.installKeyboardMonitor()
+		applyControllerSettings()
+		// Controller settings take effect immediately, also in the middle of a session.
+		NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+			.receive(on: RunLoop.main)
+			.sink { [weak self] _ in self?.applyControllerSettings() }
+			.store(in: &observers)
+	}
+
+	func applyControllerSettings() {
+		input.lightBrightness = Float(settings.lightBrightness)
+		input.playerLEDsEnabled = settings.playerLEDs
+		input.rumbleGain = Float(settings.rumbleStrength)
+		input.hapticsRumbleGain = Float(settings.rumbleStrength)
+		input.motionEnabled = settings.motionSensors
+		if input.keyboardEnabled != settings.keyboardFallback { input.keyboardEnabled = settings.keyboardFallback }
+		stream?.applyLiveSettings()
 	}
 
 	func connect(to entry: ConsoleEntry) {

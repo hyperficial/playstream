@@ -54,11 +54,9 @@ final class StreamController: ObservableObject {
 		self.input = input
 		self.consoleName = configuration.host.nickname
 		self.session = StreamSession(configuration: configuration)
-		self.video = VideoPipeline(displayMode: settings.lowLatencyRenderer ? .metal : .sampleBufferLayer)
-		var audioConfiguration = AudioPipelineConfiguration()
-		// Wi-Fi delivers audio in bursts; 35 ms glitches on every 30 ms+ gap. 55 ms rides most of them.
-		audioConfiguration.targetBufferMs = 55
-		self.audio = AudioPipeline(configuration: audioConfiguration)
+		self.video = VideoPipeline(displayMode: settings.lowLatencyRenderer ? .metal : .sampleBufferLayer, pacingMode: settings.framePacing ? .adaptive : .off)
+		// Adaptive jitter buffer: 40 ms on a clean link, growing by itself when the link stalls.
+		self.audio = AudioPipeline(configuration: AudioPipelineConfiguration())
 	}
 
 	func start() throws {
@@ -105,6 +103,15 @@ final class StreamController: ObservableObject {
 		session.stop()
 	}
 
+	/// Settings that can change in the middle of a session.
+	func applyLiveSettings() {
+		let pacing: VideoPacingMode = settings.framePacing ? .adaptive : .off
+		if video.pacingMode != pacing {
+			video.pacingMode = pacing
+			CoreLog.note("Frame pacing: \(pacing.rawValue)")
+		}
+	}
+
 	func submitPIN(_ pin: String) {
 		pinRequest = nil
 		session.setLoginPIN(pin)
@@ -143,13 +150,16 @@ final class StreamController: ObservableObject {
 		statsTick += 1
 		guard statsTick % 10 == 0, phase == .streaming else { return }
 		let v = stats.video
-		let audioText = stats.audio.map { String(format: "audio buf %.0f ms underruns %d", $0.bufferedMs, $0.underruns) } ?? "audio -"
+		let audioText = stats.audio.map { String(format: "audio buf %.0f ms target %.0f ms gap max %.0f ms underruns %d", $0.bufferedMs, $0.targetMs, $0.longestGapMs, $0.underruns) } ?? "audio -"
+		let layerDelay = v.layerFrameDelayMs.map { String(format: "%.1f", $0) } ?? "-"
 		CoreLog.note(String(
-			format: "Stats: %.0f fps %dx%d %@ | %.1f Mbit/s loss %.2f%% rtt %.1f ms | frames rx %d decoded %d dropped %d netlost %d recovered %d rejected %d layerdrop %d | handoff %.1f/%.1f ms | %@",
+			format: "Stats: %.0f fps %dx%d %@ | %.1f Mbit/s loss %.2f%% rtt %.1f ms | frames rx %d decoded %d dropped %d netlost %d recovered %d rejected %d layerdrop %d | arrival jitter p95 %.1f ms max gap %.0f ms | pacing %@ delay %.1f/%.1f ms lead %.1f ms late %d skipped %d layerdelay %@ ms | %@",
 			v.decodedFPS, v.width, v.height, v.hdrActive ? "HDR" : "SDR",
 			stats.session.measuredBitrate / 1_000_000, stats.session.packetLoss * 100, stats.session.rttMilliseconds,
 			v.framesReceived, v.framesDecoded, v.framesDropped, v.framesLostInNetwork, v.framesRecovered, v.framesRejected, v.layerDroppedFrames,
-			v.handoffAvgMs, v.handoffMaxMs, audioText
+			v.arrivalJitterP95Ms, v.arrivalMaxGapMs,
+			v.pacingMode.rawValue, v.playoutDelayMs, v.playoutTargetDelayMs, v.presentationLeadMs, v.framesLate, v.framesSkipped, layerDelay,
+			audioText
 		))
 	}
 

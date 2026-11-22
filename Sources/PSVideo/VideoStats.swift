@@ -50,6 +50,44 @@ public struct VideoStats: Sendable, Equatable {
 	/// Current display EDR headroom (1.0 = SDR display or HDR not engaged).
 	public var edrHeadroom: Double = 1
 
+	// MARK: Pacing and network arrival (arrival figures cover the last 5 s)
+
+	public var pacingMode: VideoPacingMode = .adaptive
+	/// Frame rate the pacing grid is running at (follows the console, e.g. 60 -> 30).
+	public var streamFPS: Double = 0
+	/// Mean |inter-arrival time - frame interval| of frame buffers, ms.
+	public var arrivalJitterAvgMs: Double = 0
+	/// 95th percentile of the same, ms.
+	public var arrivalJitterP95Ms: Double = 0
+	/// Longest gap between two frame arrivals, ms (a Wi-Fi stall shows up here).
+	public var arrivalMaxGapMs: Double = 0
+	/// Playout delay currently applied on top of the best-case arrival time, ms (0 when pacing is off).
+	public var playoutDelayMs: Double = 0
+	/// Delay the pacer is converging to (jitter percentile + margin, clamped), ms.
+	public var playoutTargetDelayMs: Double = 0
+	/// Frames that arrived after their presentation slot (shown at once, grid re-anchored).
+	public var framesLate: Int = 0
+	/// Frames decoded but not shown to catch up after a long stall.
+	public var framesSkipped: Int = 0
+	/// How far ahead of its target a paced frame is handed to the system so it can make that vsync,
+	/// ms. Learned from feedback (Metal: presented-time misses; layer: the layer's own frame-delay
+	/// metric). This is pipeline latency the immediate path pays as well, not extra buffering.
+	public var presentationLeadMs: Double = 0
+	/// Layer path: average time frames reached the screen after their presentation timestamp over the
+	/// last poll (AVVideoPerformanceMetrics), ms. ~0 means the layer is hitting its targets.
+	public var layerFrameDelayMs: Double?
+
+	// MARK: On-screen cadence (Metal path, from the drawables' presented times; nil on the layer path)
+
+	/// Display refresh rate the presentation is aligned to.
+	public var displayRefreshHz: Double?
+	/// Mean / max time between consecutive frames reaching the glass, ms (last second).
+	public var presentedIntervalAvgMs: Double?
+	public var presentedIntervalMaxMs: Double?
+	/// Presented intervals that were not the expected number of refreshes (e.g. not 2 at 60 fps on
+	/// 120 Hz), cumulative. Each one is a visible judder.
+	public var presentedOffCadence: Int = 0
+
 	public init() {}
 }
 
@@ -61,6 +99,7 @@ final class StatsCollector: @unchecked Sendable {
 		var decodeSum = 0.0, decodeMax = 0.0, decodeN = 0
 		var handoffSum = 0.0, handoffMax = 0.0, handoffN = 0
 		var glassSum = 0.0, glassN = 0
+		var presentSum = 0.0, presentMax = 0.0, presentN = 0
 	}
 
 	private struct State {
@@ -100,7 +139,11 @@ final class StatsCollector: @unchecked Sendable {
 	func reset(codec: VideoCodec?, mode: VideoDisplayMode) {
 		lock.withLock { s in
 			let headroom = s.stats.edrHeadroom
+			let pacing = s.stats.pacingMode
+			let lead = s.stats.presentationLeadMs
 			s = State()
+			s.stats.pacingMode = pacing
+			s.stats.presentationLeadMs = lead
 			s.stats.codec = codec
 			s.stats.displayMode = mode
 			s.stats.edrHeadroom = headroom
@@ -115,6 +158,9 @@ final class StatsCollector: @unchecked Sendable {
 			s.stats.decodeTimeAvgMs = nil
 			s.stats.decodeTimeMaxMs = nil
 			s.stats.glassAvgMs = nil
+			s.stats.presentedIntervalAvgMs = nil
+			s.stats.presentedIntervalMaxMs = nil
+			s.stats.displayRefreshHz = nil
 			s.stats.layerDroppedFrames = 0
 			s.stats.layerCorruptedFrames = 0
 			s.externalDecode = mode == .sampleBufferLayer
@@ -148,6 +194,17 @@ final class StatsCollector: @unchecked Sendable {
 		}
 	}
 
+	/// One frame reached the glass `intervalMs` after the previous one.
+	func presentedInterval(ms: Double, offCadence: Bool, refreshHz: Double) {
+		lock.withLock { s in
+			s.window.presentSum += ms
+			s.window.presentN += 1
+			s.window.presentMax = max(s.window.presentMax, ms)
+			if offCadence { s.stats.presentedOffCadence += 1 }
+			s.stats.displayRefreshHz = refreshHz
+		}
+	}
+
 	func onGlass(ms: Double) {
 		lock.withLock { s in
 			s.window.glassSum += ms
@@ -171,6 +228,10 @@ final class StatsCollector: @unchecked Sendable {
 			s.stats.handoffMaxMs = w.handoffMax
 		}
 		if w.glassN > 0 { s.stats.glassAvgMs = w.glassSum / Double(w.glassN) }
+		if w.presentN > 0 {
+			s.stats.presentedIntervalAvgMs = w.presentSum / Double(w.presentN)
+			s.stats.presentedIntervalMaxMs = w.presentMax
+		}
 		s.window = Window(start: now)
 		s.lastPublish = now
 	}
