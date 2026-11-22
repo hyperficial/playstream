@@ -82,6 +82,10 @@ public final class StreamSession: ControllerStateReceiver, KeyframeRequesting {
 	/// Called on the main queue.
 	public var onEvent: ((SessionEvent) -> Void)?
 
+	/// Called on a network thread whenever frames were lost before the one just delivered.
+	/// Set before `start()`. Must return immediately.
+	public var onVideoLoss: ((_ framesLost: Int) -> Void)?
+
 	private var handle: OpaquePointer?
 	private let lock = NSLock()
 	private var audioChannels = 2
@@ -136,6 +140,7 @@ public final class StreamSession: ControllerStateReceiver, KeyframeRequesting {
 		callbacks.video = { buf, size, framesLost, recovered, user in
 			guard let buf, let user else { return true }
 			let session = Unmanaged<StreamSession>.fromOpaque(user).takeUnretainedValue()
+			if framesLost > 0 { session.onVideoLoss?(Int(framesLost)) }
 			guard let sink = session.videoSink else { return true }
 			return sink.videoStreamDidReceive(accessUnit: UnsafeRawBufferPointer(start: buf, count: size), framesLost: Int(framesLost), frameRecovered: recovered)
 		}
@@ -183,10 +188,7 @@ public final class StreamSession: ControllerStateReceiver, KeyframeRequesting {
 
 	/// Ends the session. The `.ended` event follows on the main queue. Safe to call repeatedly.
 	public func stop() {
-		lock.lock()
-		let h = handle
-		lock.unlock()
-		if let h { ps_session_stop(h) }
+		withHandle { _ = ps_session_stop($0) }
 	}
 
 	/// Called once the core reported the session over. Joins and frees the core off the

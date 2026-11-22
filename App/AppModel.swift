@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import PSContracts
 import PSCore
@@ -19,6 +20,7 @@ final class AppModel: ObservableObject {
 	@Published var lastError: String?
 
 	private var connectTask: Task<Void, Never>?
+	private var observers: Set<AnyCancellable> = []
 
 	init() {
 		// One owner for the core's process-wide log callback: BridgeLog (pairing reads the lines
@@ -29,6 +31,12 @@ final class AppModel: ObservableObject {
 			CoreLog.record(level: line.level, message: line.message)
 		}
 		store.track(discovery)
+		// Leave a trail of what discovery sees, so a "console not found" report can be diagnosed.
+		discovery.$hosts
+			.map { hosts in hosts.map { "\($0.name) \($0.address) \($0.state.rawValue)" }.sorted() }
+			.removeDuplicates()
+			.sink { CoreLog.note("Discovery: \($0.isEmpty ? "no consoles" : $0.joined(separator: ", "))") }
+			.store(in: &observers)
 		discovery.start()
 		input.start()
 		input.installKeyboardMonitor()

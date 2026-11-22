@@ -73,6 +73,10 @@ final class StreamController: ObservableObject {
 			recorder.options.fallbackColorTags = .hdr10
 		}
 
+		// Deliberately not wiring session.onVideoLoss to recorder.noteVideoLoss(): the core only
+		// delivers frames whose references we hold, so the recorded bitstream stays decodable
+		// after a loss, and forcing a keyframe on every lost frame would spike the bitrate on
+		// exactly the links that are already struggling.
 		session.videoSink = video
 		session.audioSink = audio
 		session.hapticsSink = input
