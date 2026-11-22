@@ -506,6 +506,25 @@ PSSession *ps_session_create(const PSSessionConfig *config, const PSSessionCallb
 	memcpy(info.psn_account_id, config->psn_account_id, sizeof(info.psn_account_id));
 	info.packet_loss_max = config->packet_loss_max;
 	info.enable_idr_on_fec_failure = config->enable_idr_on_fec_failure;
+	if(config->start_bitrate_kbps)
+	{
+		uint32_t v = config->start_bitrate_kbps;
+		if(config->start_bitrate_little_endian)
+		{
+			info.start_bitrate[0] = (uint8_t)(v);
+			info.start_bitrate[1] = (uint8_t)(v >> 8);
+			info.start_bitrate[2] = (uint8_t)(v >> 16);
+			info.start_bitrate[3] = (uint8_t)(v >> 24);
+		}
+		else
+		{
+			info.start_bitrate[0] = (uint8_t)(v >> 24);
+			info.start_bitrate[1] = (uint8_t)(v >> 16);
+			info.start_bitrate[2] = (uint8_t)(v >> 8);
+			info.start_bitrate[3] = (uint8_t)(v);
+		}
+		CHIAKI_LOGI(log, "Experimental start bitrate hint: %u kbit/s (%s)", v, config->start_bitrate_little_endian ? "little endian" : "big endian");
+	}
 
 	chiaki_opus_decoder_init(&s->opus_decoder, log);
 

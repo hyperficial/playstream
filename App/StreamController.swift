@@ -96,7 +96,7 @@ final class StreamController: ObservableObject {
 		statsTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
 			MainActor.assumeIsolated { self?.refreshStats() }
 		}
-		CoreLog.note("Session started: \(configuration.profile.width)x\(configuration.profile.height)@\(configuration.profile.fps) \(configuration.profile.codec) \(configuration.profile.bitrateKbps) kbit/s, renderer \(video.displayMode.rawValue)")
+		CoreLog.note("Session started: \(configuration.profile.width)x\(configuration.profile.height)@\(configuration.profile.fps) \(configuration.profile.codec) \(configuration.profile.bitrateKbps) kbit/s, renderer \(video.displayMode.rawValue), start bitrate hint \(configuration.startBitrateHint)")
 	}
 
 	func stop() {

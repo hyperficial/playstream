@@ -130,6 +130,11 @@ typedef struct {
 	/// Maximum tolerated packet loss (0...1) used by congestion control reporting.
 	double packet_loss_max;
 	bool enable_idr_on_fec_failure;
+	/// Experimental: value for the handshake's start-bitrate field, which the core otherwise
+	/// sends as zero. What the console does with it is unknown. 0 = stock behaviour.
+	uint32_t start_bitrate_kbps;
+	/// Byte order used for start_bitrate_kbps (unknown which the console expects).
+	bool start_bitrate_little_endian;
 } PSSessionConfig;
 
 typedef struct {

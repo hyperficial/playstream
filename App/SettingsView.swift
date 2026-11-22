@@ -66,6 +66,16 @@ struct SettingsView: View {
 					.font(.caption)
 					.foregroundStyle(.secondary)
 			}
+			Section("Experimental") {
+				Picker("Start bitrate hint", selection: settings.$startBitrateHint) {
+					Text("Off").tag(0)
+					Text("Variant A").tag(1)
+					Text("Variant B").tag(2)
+				}
+				Text("Sends your bitrate in a handshake field that is normally left empty. Whether the console uses it is unknown; A and B are the two possible encodings. If a session fails to connect or looks worse, set it back to Off. Applies to the next connection.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+			}
 			Section("Audio") {
 				Slider(value: settings.$volume, in: 0...1) { Text("Volume") }
 			}

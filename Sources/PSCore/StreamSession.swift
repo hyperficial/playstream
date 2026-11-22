@@ -17,6 +17,16 @@ public struct SessionConfiguration: Sendable {
 	/// core carry on from an older reference frame. Cleaner picture, but every loss becomes a
 	/// visible stall, so it is off by default (as in the reference client).
 	public var requestKeyframeOnFECFailure: Bool
+	/// Experimental. The handshake has a start-bitrate field the core normally leaves at zero.
+	/// `.off` keeps that; the other two send the profile's bitrate in one of the two possible
+	/// byte orders (which one the console expects is unknown, as is whether it has any effect).
+	public var startBitrateHint: StartBitrateHint = .off
+
+	public enum StartBitrateHint: Int, Sendable, CaseIterable {
+		case off = 0
+		case variantA = 1 // big endian
+		case variantB = 2 // little endian
+	}
 
 	public init(host: RegisteredHost, address: String, account: PSNAccount, profile: StreamProfile = .ps5Max, enableDualSense: Bool = true, packetLossMax: Double = 0.05, requestKeyframeOnFECFailure: Bool = false) {
 		self.host = host
@@ -130,6 +140,10 @@ public final class StreamSession: ControllerStateReceiver, KeyframeRequesting {
 		config.auto_downgrade = true
 		config.packet_loss_max = cfg.packetLossMax
 		config.enable_idr_on_fec_failure = cfg.requestKeyframeOnFECFailure
+		if cfg.startBitrateHint != .off {
+			config.start_bitrate_kbps = UInt32(cfg.profile.bitrateKbps)
+			config.start_bitrate_little_endian = cfg.startBitrateHint == .variantB
+		}
 
 		// The core holds an unretained pointer to self; the matching retain is taken below once
 		// creation succeeded and released in `teardown` after the core has stopped calling us.

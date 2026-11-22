@@ -89,13 +89,14 @@ final class AppModel: ObservableObject {
 				}
 				try Task.checkCancellation()
 				self.connectProgress = "Connecting…"
-				let configuration = SessionConfiguration(
+				var configuration = SessionConfiguration(
 					host: host,
 					address: address,
 					account: account,
 					profile: self.settings.profile(isPS5: host.isPS5),
 					enableDualSense: self.settings.dualSenseFeatures && host.isPS5
 				)
+				configuration.startBitrateHint = SessionConfiguration.StartBitrateHint(rawValue: self.settings.startBitrateHint) ?? .off
 				let controller = StreamController(configuration: configuration, settings: self.settings, input: self.input)
 				controller.onEnded = { [weak self, weak controller] reason, isError in
 					guard let self, let controller, self.stream === controller else { return }

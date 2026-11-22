@@ -34,6 +34,8 @@ final class AppSettings: ObservableObject {
 	@AppStorage("controller.rumbleStrength") var rumbleStrength: Double = 1.0
 	@AppStorage("controller.motion") var motionSensors: Bool = true
 	@AppStorage("controller.keyboard") var keyboardFallback: Bool = true
+	/// Experimental start-bitrate hint: 0 off, 1 variant A, 2 variant B. Applies to the next connection.
+	@AppStorage("stream.startBitrateHint") var startBitrateHint: Int = 0
 	@AppStorage("stream.showStats") var showStats: Bool = false
 	@AppStorage("stream.lowLatencyRenderer") var lowLatencyRenderer: Bool = false
 	/// Show frames on a steady cadence (about one frame of delay) instead of the instant they arrive. Applies live.
