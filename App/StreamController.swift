@@ -130,12 +130,27 @@ final class StreamController: ObservableObject {
 		}
 	}
 
+	private var statsTick = 0
+
 	private func refreshStats() {
 		var stats = LiveStats()
 		stats.video = video.stats
 		stats.audio = audio.stats
 		stats.session = session.stats()
 		liveStats = stats
+
+		// Every 5 s leave a line in the log, so stutter reports can be diagnosed after the fact.
+		statsTick += 1
+		guard statsTick % 10 == 0, phase == .streaming else { return }
+		let v = stats.video
+		let audioText = stats.audio.map { String(format: "audio buf %.0f ms underruns %d", $0.bufferedMs, $0.underruns) } ?? "audio -"
+		CoreLog.note(String(
+			format: "Stats: %.0f fps %dx%d %@ | %.1f Mbit/s loss %.2f%% rtt %.1f ms | frames rx %d decoded %d dropped %d netlost %d recovered %d rejected %d layerdrop %d | handoff %.1f/%.1f ms | %@",
+			v.decodedFPS, v.width, v.height, v.hdrActive ? "HDR" : "SDR",
+			stats.session.measuredBitrate / 1_000_000, stats.session.packetLoss * 100, stats.session.rttMilliseconds,
+			v.framesReceived, v.framesDecoded, v.framesDropped, v.framesLostInNetwork, v.framesRecovered, v.framesRejected, v.layerDroppedFrames,
+			v.handoffAvgMs, v.handoffMaxMs, audioText
+		))
 	}
 
 	private func handle(_ event: SessionEvent) {

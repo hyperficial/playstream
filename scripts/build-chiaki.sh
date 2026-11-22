@@ -12,6 +12,16 @@ if [ ! -x "$PY" ]; then
 	"$ROOT/build/pyenv/bin/pip" -q install protobuf grpcio-tools
 fi
 
+# Apply our patches to the vendored core (idempotent).
+for patch in "$ROOT"/patches/chiaki-*.patch; do
+	[ -e "$patch" ] || continue
+	if git -C "$SRC" apply --reverse --check "$patch" 2>/dev/null; then
+		continue # already applied
+	fi
+	git -C "$SRC" apply "$patch"
+	echo "Applied $(basename "$patch")"
+done
+
 BREW="$(brew --prefix)"
 export PKG_CONFIG_PATH="$BREW/opt/openssl@4/lib/pkgconfig:$BREW/opt/curl/lib/pkgconfig:$BREW/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 export PATH="$ROOT/build/pyenv/bin:$PATH"

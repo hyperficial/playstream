@@ -1,0 +1,34 @@
+diff --git a/lib/src/takion.c b/lib/src/takion.c
+index 9916009..549da29 100644
+--- a/lib/src/takion.c
++++ b/lib/src/takion.c
+@@ -39,6 +39,7 @@
+ // VERY similar to SCTP, see RFC 4960
+ 
+ #define TAKION_A_RWND 0x19000
++#define TAKION_SOCKET_RCVBUF (4 * 1024 * 1024)
+ #define TAKION_OUTBOUND_STREAMS 0x64
+ #define TAKION_INBOUND_STREAMS 0x64
+ 
+@@ -261,7 +262,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+ 			CHIAKI_LOGE(takion->log, "Takion had problem reading extra messages from socket using PSN Connection with error: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
+ 			goto error_sock;
+ 		}
+-		const int rcvbuf_val = takion->a_rwnd;
++		// PlayStream: the advertised window (a_rwnd) stays as the protocol expects, but the kernel
++		// buffer must absorb Wi-Fi delivery bursts at high bitrates; 100 KB is ~27 ms at 30 Mbit/s.
++		const int rcvbuf_val = TAKION_SOCKET_RCVBUF;
+ 		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
+ 		if(r < 0)
+ 		{
+@@ -349,7 +352,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+ 			ret = CHIAKI_ERR_NETWORK;
+ 			goto error_pipe;
+ 		}
+-		const int rcvbuf_val = takion->a_rwnd;
++		// PlayStream: the advertised window (a_rwnd) stays as the protocol expects, but the kernel
++		// buffer must absorb Wi-Fi delivery bursts at high bitrates; 100 KB is ~27 ms at 30 Mbit/s.
++		const int rcvbuf_val = TAKION_SOCKET_RCVBUF;
+ 		int r = setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF, (const CHIAKI_SOCKET_BUF_TYPE)&rcvbuf_val, sizeof(rcvbuf_val));
+ 		if(r < 0)
+ 		{

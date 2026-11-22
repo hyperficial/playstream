@@ -15,6 +15,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -317,9 +318,21 @@ struct PSSession
 	bool joined;
 };
 
+// The video and audio callbacks run on the core's network receive thread, which is created as a
+// plain pthread at default priority. Raise it once: a stalled receive thread means dropped packets.
+static void elevate_receive_thread(void)
+{
+	static _Thread_local bool elevated;
+	if(elevated)
+		return;
+	elevated = true;
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+}
+
 static bool session_video_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
 {
 	PSSession *s = user;
+	elevate_receive_thread();
 	if(!s->cbs.video)
 		return true;
 	return s->cbs.video(buf, buf_size, frames_lost, frame_recovered, s->cbs.user);

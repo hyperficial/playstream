@@ -13,10 +13,12 @@ public struct SessionConfiguration: Sendable {
 	public var enableDualSense: Bool
 	/// Packet loss ceiling reported to the console's congestion control (0...1).
 	public var packetLossMax: Double
-	/// Ask for a keyframe as soon as error correction fails, instead of waiting for the decoder to notice.
+	/// On unrecoverable packet loss, freeze until a fresh keyframe arrives instead of letting the
+	/// core carry on from an older reference frame. Cleaner picture, but every loss becomes a
+	/// visible stall, so it is off by default (as in the reference client).
 	public var requestKeyframeOnFECFailure: Bool
 
-	public init(host: RegisteredHost, address: String, account: PSNAccount, profile: StreamProfile = .ps5Max, enableDualSense: Bool = true, packetLossMax: Double = 0.05, requestKeyframeOnFECFailure: Bool = true) {
+	public init(host: RegisteredHost, address: String, account: PSNAccount, profile: StreamProfile = .ps5Max, enableDualSense: Bool = true, packetLossMax: Double = 0.05, requestKeyframeOnFECFailure: Bool = false) {
 		self.host = host
 		self.address = address
 		self.account = account
