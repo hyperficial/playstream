@@ -84,10 +84,13 @@ final class AppModel: ObservableObject {
 				controller.onEnded = { [weak self, weak controller] reason, isError in
 					guard let self, let controller, self.stream === controller else { return }
 					self.stream = nil
+					self.discovery.start()
 					if isError { self.lastError = "Session ended: \(reason)" }
 				}
 				try controller.start()
 				self.stream = controller
+				// No broadcasts while playing: discovery has done its job and the air should be quiet.
+				self.discovery.stop()
 			} catch is CancellationError {
 			} catch {
 				self.lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
