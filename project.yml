@@ -1,0 +1,47 @@
+name: PlayStream
+options:
+  bundleIdPrefix: dev.playstream
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  PlayStreamKit:
+    path: .
+targets:
+  PlayStream:
+    type: application
+    platform: macOS
+    sources:
+      - App
+    dependencies:
+      - package: PlayStreamKit
+        product: PlayStreamKit
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: PlayStream
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSApplicationCategoryType: public.app-category.games
+        LSSupportsGameMode: true
+        GCSupportsGameMode: true
+        GCSupportsControllerUserInteraction: true
+        NSHighResolutionCapable: true
+        NSLocalNetworkUsageDescription: PlayStream finds and connects to your PlayStation on the local network.
+        NSMicrophoneUsageDescription: PlayStream can send your microphone to the console for voice chat.
+    entitlements:
+      path: App/PlayStream.entitlements
+      properties: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.playstream.PlayStream
+        SWIFT_VERSION: "5.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Development"
+        DEVELOPMENT_TEAM: ""
+        PROVISIONING_PROFILE_SPECIFIER: ""
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

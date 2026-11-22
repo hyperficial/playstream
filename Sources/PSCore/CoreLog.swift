@@ -1,0 +1,79 @@
+import CPSBridge
+import Foundation
+import os
+
+/// Routes the protocol core's log lines to the unified log and to a rotating file at
+/// ~/Library/Logs/PlayStream/core.log, so a failed connection can be diagnosed afterwards.
+public enum CoreLog {
+	public struct Level: OptionSet, Sendable {
+		public let rawValue: UInt32
+		public init(rawValue: UInt32) { self.rawValue = rawValue }
+		public static let error = Level(rawValue: 1)
+		public static let warning = Level(rawValue: 2)
+		public static let info = Level(rawValue: 4)
+		public static let verbose = Level(rawValue: 8)
+		public static let debug = Level(rawValue: 16)
+		public static let standard: Level = [.error, .warning, .info]
+	}
+
+	public static var fileURL: URL {
+		FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+			.appendingPathComponent("Logs/PlayStream/core.log")
+	}
+
+	private static let logger = Logger(subsystem: "playstream", category: "core")
+	private static let queue = DispatchQueue(label: "playstream.corelog")
+	private static var file: FileHandle?
+	private static var echoToStderr = false
+	private static let maxFileSize: UInt64 = 8 * 1024 * 1024
+	private static let formatter: DateFormatter = {
+		let f = DateFormatter()
+		f.dateFormat = "HH:mm:ss.SSS"
+		return f
+	}()
+
+	/// Call once at launch.
+	public static func install(levels: Level = .standard, echoToStderr: Bool = false) {
+		queue.sync {
+			self.echoToStderr = echoToStderr
+			let url = fileURL
+			try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+			if let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? UInt64, size > maxFileSize {
+				let old = url.deletingPathExtension().appendingPathExtension("old.log")
+				try? FileManager.default.removeItem(at: old)
+				try? FileManager.default.moveItem(at: url, to: old)
+			}
+			if !FileManager.default.fileExists(atPath: url.path) {
+				FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
+			}
+			file = try? FileHandle(forWritingTo: url)
+			_ = try? file?.seekToEnd()
+		}
+		ps_log_set_callback({ level, msg, _ in
+			guard let msg else { return }
+			CoreLog.write(level: level, message: String(cString: msg))
+		}, nil, levels.rawValue)
+		write(level: 4, message: "──── log started ────")
+	}
+
+	/// Also available to the app for its own lines.
+	public static func note(_ message: String) {
+		write(level: 4, message: message)
+	}
+
+	private static func write(level: UInt32, message: String) {
+		let tag: String
+		switch level {
+		case 1: tag = "E"; logger.error("\(message, privacy: .public)")
+		case 2: tag = "W"; logger.warning("\(message, privacy: .public)")
+		case 4: tag = "I"; logger.info("\(message, privacy: .public)")
+		default: tag = "D"; logger.debug("\(message, privacy: .public)")
+		}
+		let now = Date()
+		queue.async {
+			let line = "\(formatter.string(from: now)) [\(tag)] \(message)\n"
+			if echoToStderr { FileHandle.standardError.write(Data(line.utf8)) }
+			try? file?.write(contentsOf: Data(line.utf8))
+		}
+	}
+}
