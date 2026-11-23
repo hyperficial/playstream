@@ -1,0 +1,55 @@
+diff --git a/lib/include/chiaki/streamconnection.h b/lib/include/chiaki/streamconnection.h
+index 56ec7b6..c492034 100644
+--- a/lib/include/chiaki/streamconnection.h
++++ b/lib/include/chiaki/streamconnection.h
+@@ -78,6 +78,17 @@ typedef struct chiaki_stream_connection_t
+ 	char *remote_disconnect_reason;
+ 
+ 	double measured_bitrate;
++
++	// PlayStream: the console's own view of the connection (last CONNECTIONQUALITY report) and
++	// counters for what we told it. Written on the Takion thread, read unsynchronised for stats.
++	uint32_t ps_cq_target_bitrate; // bit/s the console is currently aiming for
++	uint32_t ps_cq_upstream_bitrate;
++	float ps_cq_upstream_loss;
++	double ps_cq_rtt;
++	uint64_t ps_cq_loss;
++	uint64_t ps_cq_reports;
++	uint64_t ps_corrupt_reports_sent;
++	uint64_t ps_idr_requests_sent;
+ } ChiakiStreamConnection;
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnection *stream_connection, ChiakiSession *session, double packet_loss_max);
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index afa1a60..4244ab7 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -701,6 +701,12 @@ static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_co
+ 			 q.target_bitrate, q.upstream_bitrate,
+ 			 q.upstream_loss,
+ 			 q.disable_upstream_audio, q.rtt, q.loss);
++		stream_connection->ps_cq_target_bitrate = q.target_bitrate;
++		stream_connection->ps_cq_upstream_bitrate = q.upstream_bitrate;
++		stream_connection->ps_cq_upstream_loss = q.upstream_loss;
++		stream_connection->ps_cq_rtt = q.rtt;
++		stream_connection->ps_cq_loss = q.loss;
++		stream_connection->ps_cq_reports++;
+ 		stream_connection->measured_bitrate = chiaki_stream_stats_bitrate(&stream_connection->video_receiver->frame_processor.stream_stats, stream_connection->session->connect_info.video_profile.max_fps) / 1000000.0;
+ 		CHIAKI_LOGV(stream_connection->log, "StreamConnection measured bitrate: %.4f MBit/s", stream_connection->measured_bitrate);
+ 		chiaki_stream_stats_reset(&stream_connection->video_receiver->frame_processor.stream_stats);
+@@ -1262,6 +1268,7 @@ static ChiakiErrorCode stream_connection_send_heartbeat(ChiakiStreamConnection *
+ 
+ CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_corrupt_frame(ChiakiStreamConnection *stream_connection, ChiakiSeqNum16 start, ChiakiSeqNum16 end)
+ {
++	stream_connection->ps_corrupt_reports_sent++;
+ 	tkproto_TakionMessage msg = { 0 };
+ 	msg.type = tkproto_TakionMessage_PayloadType_CORRUPTFRAME;
+ 	msg.has_corrupt_payload = true;
+@@ -1284,6 +1291,7 @@ CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_corrupt_frame(ChiakiStreamC
+ 
+ CHIAKI_EXPORT ChiakiErrorCode stream_connection_send_idr_request(ChiakiStreamConnection *stream_connection)
+ {
++	stream_connection->ps_idr_requests_sent++;
+ 	tkproto_TakionMessage msg = { 0 };
+ 	msg.type = tkproto_TakionMessage_PayloadType_IDRREQUEST;
+ 

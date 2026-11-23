@@ -237,6 +237,12 @@ final class StreamController: ObservableObject {
 			v.pacingMode.rawValue, v.playoutDelayMs, v.playoutTargetDelayMs, v.presentationLeadMs, v.framesLate, v.framesSkipped, layerDelay,
 			audioText
 		))
+		let c = stats.session
+		CoreLog.note(String(
+			format: "Console: target %.1f Mbit/s (asked %.0f) rtt %.1f loss %llu reports %llu | corrupt reports sent %llu keyframe requests %llu",
+			c.consoleTargetBitrate / 1_000_000, Double(configuration.profile.bitrateKbps) / 1000,
+			c.consoleRTT, c.consoleLoss, c.consoleReports, c.corruptReportsSent, c.keyframeRequestsSent
+		))
 	}
 
 	private func handle(_ event: SessionEvent) {

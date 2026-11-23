@@ -63,6 +63,16 @@ public struct SessionStats: Sendable, Equatable {
 	public var rttMilliseconds: Double = 0
 	public var mtuIn: Int = 0
 	public var mtuOut: Int = 0
+	/// Bitrate the console is currently aiming for, bit/s (0 until its first report). It starts
+	/// near the requested ceiling and drops when loss is reported to it.
+	public var consoleTargetBitrate: Double = 0
+	/// Round trip and loss as the console itself measures them, updated live.
+	public var consoleRTT: Double = 0
+	public var consoleLoss: UInt64 = 0
+	public var consoleReports: UInt64 = 0
+	/// How often we reported a corrupt frame to the console, and asked it for a keyframe.
+	public var corruptReportsSent: UInt64 = 0
+	public var keyframeRequestsSent: UInt64 = 0
 	public init() {}
 }
 
@@ -298,6 +308,12 @@ public final class StreamSession: ControllerStateReceiver, KeyframeRequesting {
 			out.rttMilliseconds = Double(raw.rtt_us) / 1000
 			out.mtuIn = Int(raw.mtu_in)
 			out.mtuOut = Int(raw.mtu_out)
+			out.consoleTargetBitrate = Double(raw.console_target_bitrate)
+			out.consoleRTT = raw.console_rtt
+			out.consoleLoss = raw.console_loss
+			out.consoleReports = raw.console_reports
+			out.corruptReportsSent = raw.corrupt_reports_sent
+			out.keyframeRequestsSent = raw.idr_requests_sent
 		}
 		return out
 	}

@@ -232,6 +232,21 @@ typedef struct {
 	uint64_t rtt_us;
 	uint32_t mtu_in;
 	uint32_t mtu_out;
+
+	// The console's own live view of the connection (updated several times a second while
+	// streaming; all zero until the first report). This, not the values above, is what its
+	// encoder reacts to.
+	/// Bitrate the console is currently aiming for, bit/s. It starts near the requested ceiling
+	/// and is lowered when loss is reported to it.
+	uint32_t console_target_bitrate;
+	/// Round trip as measured by the console, in the unit it reports (believed milliseconds).
+	double console_rtt;
+	/// Loss counter as reported by the console.
+	uint64_t console_loss;
+	uint64_t console_reports;
+	/// How often we told the console a frame was corrupt, and how often we asked for a keyframe.
+	uint64_t corrupt_reports_sent;
+	uint64_t idr_requests_sent;
 } PSSessionStats;
 
 typedef struct PSSession PSSession;

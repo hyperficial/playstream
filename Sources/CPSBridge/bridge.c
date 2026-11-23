@@ -9,6 +9,7 @@
 #include <chiaki/opusdecoder.h>
 #include <chiaki/regist.h>
 #include <chiaki/session.h>
+#include <chiaki/thread.h>
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -37,9 +38,32 @@ static void log_trampoline(ChiakiLogLevel level, const char *msg, void *user)
 		chiaki_log_cb_print(level, msg, NULL);
 }
 
+// Runs inside each of the core's worker threads as it starts. The receive, send, input-feedback
+// and decryption threads are latency-critical; everything else stays at the default.
+static void thread_started(ChiakiThreadName name, void *user)
+{
+	(void)user;
+	switch(name)
+	{
+		case CHIAKI_THREAD_NAME_TAKION:
+		case CHIAKI_THREAD_NAME_TAKION_SEND:
+		case CHIAKI_THREAD_NAME_FEEDBACK:
+		case CHIAKI_THREAD_NAME_GKCRYPT:
+			pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+			break;
+		case CHIAKI_THREAD_NAME_CONGESTION:
+		case CHIAKI_THREAD_NAME_CTRL:
+			pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+			break;
+		default:
+			break;
+	}
+}
+
 static void global_init(void)
 {
 	chiaki_lib_init();
+	chiaki_thread_set_affinity_cb(thread_started, NULL);
 	chiaki_log_init(&g_log, CHIAKI_LOG_ALL & ~(CHIAKI_LOG_VERBOSE | CHIAKI_LOG_DEBUG), log_trampoline, NULL);
 }
 
@@ -671,4 +695,10 @@ void ps_session_get_stats(PSSession *s, PSSessionStats *out)
 	out->rtt_us = s->session.rtt_us;
 	out->mtu_in = s->session.mtu_in;
 	out->mtu_out = s->session.mtu_out;
+	out->console_target_bitrate = s->session.stream_connection.ps_cq_target_bitrate;
+	out->console_rtt = s->session.stream_connection.ps_cq_rtt;
+	out->console_loss = s->session.stream_connection.ps_cq_loss;
+	out->console_reports = s->session.stream_connection.ps_cq_reports;
+	out->corrupt_reports_sent = s->session.stream_connection.ps_corrupt_reports_sent;
+	out->idr_requests_sent = s->session.stream_connection.ps_idr_requests_sent;
 }
