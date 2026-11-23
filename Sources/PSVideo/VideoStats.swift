@@ -202,6 +202,52 @@ public struct VideoStats: Sendable, Equatable {
 	public var pacedQueueDepthMax: Int = 0
 	public var drawableWaitMaxMs: Double = 0
 
+	// MARK: Presentation path (Metal; grid-free measurements for variable refresh)
+
+	/// `present.mode` in force: 0 paced grid, 1 lowest latency, 2 smooth.
+	public var presentMode: Int = 0
+	/// Direct-to-display layout (`present.fullLayer`): layer covers the view, native-resolution drawable.
+	public var presentFullLayer: Bool = false
+	/// The video's window is in native full screen (nil = no window).
+	public var nativeFullScreen: Bool?
+	/// Panel limits from NSScreen: shortest / longest refresh interval and update granularity (ms).
+	public var displayMinRefreshIntervalMs: Double?
+	public var displayMaxRefreshIntervalMs: Double?
+	public var displayUpdateGranularityMs: Double?
+	/// Re-presents of the last picture to keep the panel in range (not stream frames), and how many of
+	/// them the system reported as not shown.
+	public var keepAlivePresents: Int = 0
+	public var keepAliveNotShown: Int = 0
+	/// Pictures presented "as soon as possible" (mode 1, no requested time), cumulative.
+	public var asapPresents: Int = 0
+	/// On-screen interval minus the picture's own interval (stream interval, or the generated
+	/// picture's half interval), ms, last ~600 pictures: p50 / p95 of the absolute error.
+	public var presentIntervalErrorP50Ms: Double?
+	public var presentIntervalErrorP95Ms: Double?
+	/// Cumulative histogram of (on-screen interval - expected), ms: [< -6, -6..-2, -2..2, 2..6, 6..12, > 12].
+	public var presentIntervalErrorHistogram: [Int] = [0, 0, 0, 0, 0, 0]
+	/// Arrival (network) to on-glass for real pictures, ms, last ~600: p50 / p95.
+	public var arrivalToPresentedP50Ms: Double?
+	public var arrivalToPresentedP95Ms: Double?
+	/// Presented minus requested time (signed, ms) for timed presents, last ~600: p50 / p95.
+	public var requestedToPresentedP50Ms: Double?
+	public var requestedToPresentedP95Ms: Double?
+	/// Display update cadence from NSScreen.lastDisplayUpdateTimestamp (`present.sampleDisplayUpdates`):
+	/// interval between panel updates, ms, last ~600, and the mean updates per second over them.
+	public var displayUpdateIntervalP50Ms: Double?
+	public var displayUpdateIntervalP95Ms: Double?
+	public var displayUpdateIntervalMaxMs: Double?
+	public var displayUpdatesPerSecond: Double?
+	/// Decoder submit-to-output latency, ms, last ~600: p50 / p95 (avg/max per second are above), and the
+	/// most pictures inside the decoder at once in the last second (holding pictures shows up here).
+	public var decodeLatencyP50Ms: Double?
+	public var decodeLatencyP95Ms: Double?
+	public var decoderInFlightMax: Int = 0
+	/// Metal performance HUD shown on the video layer.
+	public var metalHUD: Bool = false
+	/// An in-frame overlay image is set.
+	public var overlayActive: Bool = false
+
 	public init() {}
 }
 
@@ -220,6 +266,7 @@ final class StatsCollector: @unchecked Sendable {
 		var depthMax = 0
 		var waitMax = 0.0
 		var scalerSum = 0.0, scalerN = 0
+		var inFlightMax = 0
 	}
 
 	/// Fixed-size ring of floats (no allocation after init).
@@ -249,6 +296,19 @@ final class StatsCollector: @unchecked Sendable {
 		var lastPublish: UInt64 = 0
 		/// Decoded counts/fps come from the display layer's own metrics instead of per-frame callbacks.
 		var externalDecode = false
+		var intervalError = FloatRing(600)
+		var toGlass = FloatRing(600)
+		var requestErr = FloatRing(600)
+		var displayUpdates = FloatRing(600)
+		var decodeLat = FloatRing(600)
+	}
+
+	private static func pct(_ r: FloatRing, _ p: Double, abs absolute: Bool = false) -> Double? {
+		guard r.count > 0 else { return nil }
+		var a = r.array()
+		if absolute { a = a.map { Swift.abs($0) } }
+		a.sort()
+		return Double(a[min(a.count - 1, Int(Double(a.count - 1) * p))])
 	}
 
 	private let lock = OSAllocatedUnfairLock(initialState: State())
@@ -285,6 +345,21 @@ final class StatsCollector: @unchecked Sendable {
 				out.frameTimeMaxMs = Double(recent.last!)
 			}
 			if s.presentedWindowStart > 0 && now - s.presentedWindowStart > 2 { out.presentedFPS = 0 } // stalled
+			out.presentIntervalErrorP50Ms = Self.pct(s.intervalError, 0.5, abs: true)
+			out.presentIntervalErrorP95Ms = Self.pct(s.intervalError, 0.95, abs: true)
+			out.arrivalToPresentedP50Ms = Self.pct(s.toGlass, 0.5)
+			out.arrivalToPresentedP95Ms = Self.pct(s.toGlass, 0.95)
+			out.requestedToPresentedP50Ms = Self.pct(s.requestErr, 0.5)
+			out.requestedToPresentedP95Ms = Self.pct(s.requestErr, 0.95)
+			out.displayUpdateIntervalP50Ms = Self.pct(s.displayUpdates, 0.5)
+			out.displayUpdateIntervalP95Ms = Self.pct(s.displayUpdates, 0.95)
+			out.displayUpdateIntervalMaxMs = Self.pct(s.displayUpdates, 1)
+			if s.displayUpdates.count > 0 {
+				let sum = s.displayUpdates.array().reduce(0, +)
+				if sum > 0 { out.displayUpdatesPerSecond = Double(s.displayUpdates.count) * 1000 / Double(sum) }
+			}
+			out.decodeLatencyP50Ms = Self.pct(s.decodeLat, 0.5)
+			out.decodeLatencyP95Ms = Self.pct(s.decodeLat, 0.95)
 			// No completed window for 2 s: the stream is stalled.
 			if !s.externalDecode && s.lastPublish != 0 && Self.ms(from: s.lastPublish, to: mach_absolute_time()) > 2000 {
 				out.decodedFPS = 0
@@ -300,7 +375,17 @@ final class StatsCollector: @unchecked Sendable {
 			let lead = s.stats.presentationLeadMs
 			let up = s.stats.upscaler
 			let fg = s.stats.frameGeneration
+			let keep = s.stats
 			s = State()
+			// Display / presentation configuration survives a stream restart.
+			s.stats.displayMinRefreshIntervalMs = keep.displayMinRefreshIntervalMs
+			s.stats.displayMaxRefreshIntervalMs = keep.displayMaxRefreshIntervalMs
+			s.stats.displayUpdateGranularityMs = keep.displayUpdateGranularityMs
+			s.stats.nativeFullScreen = keep.nativeFullScreen
+			s.stats.presentMode = keep.presentMode
+			s.stats.presentFullLayer = keep.presentFullLayer
+			s.stats.metalHUD = keep.metalHUD
+			s.stats.overlayActive = keep.overlayActive
 			s.stats.frameGeneration = fg
 			s.stats.pacingMode = pacing
 			s.stats.presentationLeadMs = lead
@@ -342,6 +427,7 @@ final class StatsCollector: @unchecked Sendable {
 			s.stats.framesDecoded += 1
 			s.window.decoded += 1
 			if let d = decodeMs {
+				s.decodeLat.push(Float(d))
 				s.window.decodeSum += d
 				s.window.decodeN += 1
 				s.window.decodeMax = max(s.window.decodeMax, d)
@@ -399,6 +485,44 @@ final class StatsCollector: @unchecked Sendable {
 			s.window.errN += 1
 			s.window.errMax = max(s.window.errMax, errorMs)
 		}
+	}
+
+	/// Grid-free cadence: one picture stayed `intervalMs` on screen where `expectedMs` was intended.
+	func presentedVRR(intervalMs: Double, expectedMs: Double) {
+		lock.withLock { s in
+			let e = intervalMs - expectedMs
+			s.intervalError.push(Float(e))
+			let b = e < -6 ? 0 : e < -2 ? 1 : e <= 2 ? 2 : e <= 6 ? 3 : e <= 12 ? 4 : 5
+			s.stats.presentIntervalErrorHistogram[b] += 1
+		}
+	}
+
+	func arrivalToPresented(ms: Double) {
+		lock.withLock { $0.toGlass.push(Float(ms)) }
+	}
+
+	func requestedToPresented(ms: Double) {
+		lock.withLock { $0.requestErr.push(Float(ms)) }
+	}
+
+	func keepAlive(issued: Bool = false, notShown: Bool = false) {
+		lock.withLock { s in
+			if issued { s.stats.keepAlivePresents += 1 }
+			if notShown { s.stats.keepAliveNotShown += 1 }
+		}
+	}
+
+	func asapPresent() {
+		lock.withLock { $0.stats.asapPresents += 1 }
+	}
+
+	/// The panel updated `ms` after its previous update (NSScreen.lastDisplayUpdateTimestamp).
+	func displayUpdate(intervalMs ms: Double) {
+		lock.withLock { $0.displayUpdates.push(Float(ms)) }
+	}
+
+	func decoderInFlight(_ n: Int) {
+		lock.withLock { s in s.window.inFlightMax = max(s.window.inFlightMax, n) }
 	}
 
 	func presentNotShown() {
@@ -491,6 +615,7 @@ final class StatsCollector: @unchecked Sendable {
 		if w.aheadMin.isFinite { s.stats.commitAheadMinMs = w.aheadMin }
 		s.stats.pacedQueueDepthMax = w.depthMax
 		s.stats.drawableWaitMaxMs = w.waitMax
+		s.stats.decoderInFlightMax = w.inFlightMax
 		if w.presentN > 0 {
 			s.stats.presentedIntervalAvgMs = w.presentSum / Double(w.presentN)
 			s.stats.presentedIntervalMaxMs = w.presentMax

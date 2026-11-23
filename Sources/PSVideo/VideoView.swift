@@ -22,6 +22,7 @@ public final class VideoView: NSView {
 		wantsLayer = true
 		layerContentsRedrawPolicy = .never
 		rootLayer.onContentPixelSize = { [weak pipeline] size in pipeline?.contentPixelSizeChanged(size) }
+		rootLayer.onLayout = { [weak pipeline] bounds, rect, scale in pipeline?.layoutChanged(boundsPx: bounds, contentRectPx: rect, scale: scale) }
 		pipeline.attach(self)
 	}
 
@@ -39,13 +40,34 @@ public final class VideoView: NSView {
 		rootLayer.videoSize = size
 	}
 
+	/// Direct-to-display layout (`present.fullLayer`): the content layer covers the whole view and no
+	/// PSVideo layer paints (the renderer draws the bars into its native-resolution drawable).
+	func setFullLayer(_ on: Bool) {
+		guard rootLayer.fullLayer != on else { return }
+		rootLayer.fullLayer = on
+		rootLayer.backgroundColor = on ? nil : NSColor.black.cgColor
+		rootLayer.setNeedsLayout()
+	}
+
+	private var fullScreenObservers: [NSObjectProtocol] = []
+
+	private func reportFullScreen() {
+		pipeline.nativeFullScreenChanged(window.map { $0.styleMask.contains(.fullScreen) })
+	}
+
 	public override func viewDidMoveToWindow() {
 		super.viewDidMoveToWindow()
 		if let o = screenObserver { NotificationCenter.default.removeObserver(o) }
 		screenObserver = nil
 		refreshKeeper?.invalidate()
 		refreshKeeper = nil
+		fullScreenObservers.forEach { NotificationCenter.default.removeObserver($0) }
+		fullScreenObservers = []
+		reportFullScreen()
 		guard let window else { return }
+		for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
+			fullScreenObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in self?.reportFullScreen() })
+		}
 		let link = displayLink(target: self, selector: #selector(refreshTick(_:)))
 		link.add(to: .main, forMode: .common)
 		refreshKeeper = link
@@ -82,6 +104,7 @@ public final class VideoView: NSView {
 
 	deinit {
 		if let o = screenObserver { NotificationCenter.default.removeObserver(o) }
+		fullScreenObservers.forEach { NotificationCenter.default.removeObserver($0) }
 		refreshKeeper?.invalidate()
 	}
 }
@@ -91,7 +114,11 @@ final class VideoRootLayer: CALayer {
 	private(set) var content: CALayer?
 	/// Pixel size of the video rect after layout (drives the Metal path's upscaler).
 	var onContentPixelSize: ((CGSize) -> Void)?
+	/// Bounds and aspect-fit video rect in backing pixels (top-left origin), and the backing scale.
+	var onLayout: ((CGSize, CGRect, Double) -> Void)?
+	var fullLayer = false
 	private var lastPixelSize = CGSize.zero
+	private var lastLayout: (CGSize, CGRect, Double)?
 	var videoSize: CGSize = .zero {
 		didSet { if videoSize != oldValue { setNeedsLayout() } }
 	}
@@ -115,14 +142,26 @@ final class VideoRootLayer: CALayer {
 		guard let content, content.superlayer === self else { return }
 		CATransaction.begin()
 		CATransaction.setDisableActions(true)
+		let fit: CGRect
 		if content is AVSampleBufferDisplayLayer || videoSize.width <= 0 || videoSize.height <= 0 {
 			// The display layer letterboxes itself (videoGravity = resizeAspect).
+			fit = bounds
 			content.frame = bounds
 		} else {
-			content.frame = AVMakeRect(aspectRatio: videoSize, insideRect: bounds).integral
+			fit = AVMakeRect(aspectRatio: videoSize, insideRect: bounds).integral
+			// Full layer: the Metal layer covers everything and draws the bars itself.
+			content.frame = fullLayer ? bounds : fit
 		}
 		CATransaction.commit()
-		let px = CGSize(width: (content.frame.width * contentsScale).rounded(), height: (content.frame.height * contentsScale).rounded())
+		let sc = contentsScale
+		let boundsPx = CGSize(width: (bounds.width * sc).rounded(), height: (bounds.height * sc).rounded())
+		// Top-left origin (the layer tree here is not flipped: y grows upwards).
+		let rectPx = CGRect(x: (fit.minX - bounds.minX) * sc, y: (bounds.maxY - fit.maxY) * sc, width: fit.width * sc, height: fit.height * sc).integral
+		if lastLayout.map({ $0.0 != boundsPx || $0.1 != rectPx || $0.2 != Double(sc) }) ?? true {
+			lastLayout = (boundsPx, rectPx, Double(sc))
+			onLayout?(boundsPx, rectPx, Double(sc))
+		}
+		let px = CGSize(width: (fit.width * contentsScale).rounded(), height: (fit.height * contentsScale).rounded())
 		if px != lastPixelSize {
 			lastPixelSize = px
 			onContentPixelSize?(px)

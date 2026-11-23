@@ -62,11 +62,15 @@ struct Options {
 	var slipEveryMs = 0.0
 	var captureFile: String?
 	var bunch = 0.0
+	var streamInfo: String?
+	var stripVUI = false
 	var steady = false
 	var makeCapture: String?
 	var traceOut: String?
 	var captureFramesDir: String?
 	var tunableSets: [(String, Double)] = []
+	var timedSets: [(Double, String, Double)] = []
+	var overlay = false
 	var fgMethod: VideoFrameGenerationMethod = .extrapolate
 	var qualityRef: String?
 	var upscaler: VideoUpscaler = .off
@@ -130,9 +134,17 @@ while !args.isEmpty {
 	case "--capture": opt.captureFile = next()
 	case "--steady": opt.steady = true
 	case "--bunch": opt.bunch = Double(next()) ?? 0
+	case "--stream-info": opt.streamInfo = next()
+	case "--strip-vui": opt.stripVUI = true
 	case "--make-capture": opt.makeCapture = next()
 	case "--trace": opt.traceOut = next()
 	case "--capture-frames": opt.captureFramesDir = next()
+	case "--set-at":
+		// seconds:name=value
+		let a = next().split(separator: ":", maxSplits: 1)
+		let kv = a.count == 2 ? a[1].split(separator: "=") : []
+		if a.count == 2, kv.count == 2, let t = Double(a[0]), let v = Double(kv[1]) { opt.timedSets.append((t, String(kv[0]), v)) }
+	case "--overlay": opt.overlay = true
 	case "--set":
 		let kv = next().split(separator: "=")
 		if kv.count == 2, let v = Double(kv[1]) { opt.tunableSets.append((String(kv[0]), v)) }
@@ -334,17 +346,40 @@ log("loaded \(opt.file): header \(header.count) B, \(frames.count) frames, keyfr
 
 // MARK: - Stream capture (PSCAP1)
 
+/// Prints the SPS reorder / DPB fields of a PSCAP1 capture (header and in-band) or an elementary stream.
+if let f = opt.streamInfo {
+	var units: [[UInt8]] = []
+	var hevc = opt.codec != .h264
+	if let rp = try? StreamCaptureFile.read(from: URL(fileURLWithPath: f)) {
+		hevc = rp.header.profile.codec != .h264
+		print("capture: \(rp.header.profile.width)x\(rp.header.profile.height)@\(rp.header.profile.fps) \(rp.header.profile.codec), \(rp.records.count) records, notes: \(rp.header.notes)")
+		units = rp.records.prefix(600).map { [UInt8]($0.data) }
+	} else if let d = FileManager.default.contents(atPath: f) {
+		units = [[UInt8](d)]
+	}
+	var seen = Set<String>()
+	for u in units {
+		for info in spsInfos(u, hevc: hevc) where !seen.contains(info.description) {
+			seen.insert(info.description)
+			print("SPS \(info)")
+		}
+	}
+	if seen.isEmpty { print("no SPS found") }
+	exit(0)
+}
+
 /// Writes a PSCAP1 file from the loaded elementary stream with arrival times from the arrival model
 /// (pattern / jitter / stalls / slips options), header first, like the protocol core delivers it.
 if let out = opt.makeCapture {
 	let fps = opt.sendFPS ?? Double(opt.fps)
 	let model = ArrivalModel(seed: opt.seed, interval: 1 / fps)
 	let n = min(frames.count * (opt.loop ? 100 : 1), Int(opt.seconds * fps))
-	var records = [StreamCaptureRecord(arrivalNanoseconds: 0, framesLost: 0, frameRecovered: false, data: Data(header))]
+	let fix: ([UInt8]) -> [UInt8] = { opt.stripVUI && opt.codec == .h264 ? stripH264VUI($0) : $0 }
+	var records = [StreamCaptureRecord(arrivalNanoseconds: 0, framesLost: 0, frameRecovered: false, data: Data(fix(header)))]
 	let order = (0..<n).map { i -> Int in opt.loop ? (i < frames.count ? i : (keyIdx.first ?? 0) + (i - frames.count) % (frames.count - (keyIdx.first ?? 0))) : i }
 	for (k, i) in order.enumerated() {
 		let t = 0.005 + model.arrival(k)
-		records.append(StreamCaptureRecord(arrivalNanoseconds: UInt64(t * 1e9), framesLost: 0, frameRecovered: false, data: Data(frames[i].bytes)))
+		records.append(StreamCaptureRecord(arrivalNanoseconds: UInt64(t * 1e9), framesLost: 0, frameRecovered: false, data: Data(fix(frames[i].bytes))))
 	}
 	let profile = StreamProfile(width: 1920, height: 1080, fps: Int(fps), bitrateKbps: 30000, codec: opt.codec)
 	try! StreamCaptureFile.write(header: StreamCaptureHeader(profile: profile, startedAt: Date(), notes: "synthetic: \(opt.file) pattern=\(opt.pattern) jitter=\(opt.jitterMs) bunch=\(opt.bunch) stall=\(opt.stallEveryMs)/\(opt.stallMinMs)-\(opt.stallMaxMs) slips=\(opt.slipEveryMs)"),
@@ -944,6 +979,40 @@ if let dir = opt.captureFramesDir {
 		}
 	}
 }
+for (t, k, v) in opt.timedSets {
+	DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+		log("set \(k)=\(v) at \(t) s: \(pipeline.setDebugTunable(k, to: v) ? "ok" : "REJECTED")")
+	}
+}
+func residentMB() -> Double {
+	var info = mach_task_basic_info()
+	var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+	let r = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count) } }
+	return r == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576 : 0
+}
+var rssSamples: [(Double, Double)] = []
+/// Overlay exercise: a 480x120 panel with a counter, re-uploaded 4 times a second (like a stats overlay).
+var overlayUpdates = 0
+var overlayUploadMs: [Double] = []
+if opt.overlay {
+	let t = Timer(timeInterval: 0.25, repeats: true) { _ in
+		overlayUpdates += 1
+		let w = 480, h = 120
+		guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+		                          bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return }
+		ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.6))
+		ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+		ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+		// A bar whose length changes with every update, plus a white frame.
+		ctx.fill(CGRect(x: 16, y: 16, width: 20 + (overlayUpdates * 37) % 440, height: 24))
+		ctx.stroke(CGRect(x: 2, y: 2, width: w - 4, height: h - 4), width: 4)
+		guard let img = ctx.makeImage() else { return }
+		let t0 = CACurrentMediaTime()
+		pipeline.setOverlay(img, origin: CGPoint(x: 20, y: 20))
+		overlayUploadMs.append((CACurrentMediaTime() - t0) * 1000)
+	}
+	RunLoop.main.add(t, forMode: .common)
+}
 feeder.start()
 var lastPrint = CACurrentMediaTime()
 var shotTaken = false
@@ -957,6 +1026,7 @@ while Date() < deadline {
 	let now = CACurrentMediaTime()
 	if now - lastPrint >= 1 {
 		lastPrint = now
+		rssSamples.append((now - startTime, residentMB()))
 		if !opt.quiet { log(describe(pipeline.stats)) }
 		if opt.quiet && opt.pattern != "none" { log(describePacing(pipeline.stats)) }
 	}
@@ -1008,6 +1078,15 @@ if let tr = opt.traceOut {
 }
 summarizePresentation()
 summarizeSchedule()
+do {
+	let s = final
+	func f(_ v: Double?) -> String { v.map { String(format: "%.2f", $0) } ?? "-" }
+	log("PRESENT mode=\(s.presentMode) fullLayer=\(s.presentFullLayer) hud=\(s.metalHUD) overlay=\(s.overlayActive) asap=\(s.asapPresents) keepAlive=\(s.keepAlivePresents) (notShown \(s.keepAliveNotShown)) notShown=\(s.presentsNotShown) superseded=\(s.dropsSuperseded) noDrawable=\(s.dropsNoDrawable) queueOverflow=\(s.dropsQueueOverflow) drawableWaitMax(last s)=\(f(s.drawableWaitMaxMs)) panel=\(f(s.displayMinRefreshIntervalMs))-\(f(s.displayMaxRefreshIntervalMs)) ms gran \(f(s.displayUpdateGranularityMs)) fullScreen=\(s.nativeFullScreen.map { "\($0)" } ?? "-")")
+	log("PRESENT intervalErr p50/p95 \(f(s.presentIntervalErrorP50Ms))/\(f(s.presentIntervalErrorP95Ms)) hist \(s.presentIntervalErrorHistogram) arrival->glass p50/p95 \(f(s.arrivalToPresentedP50Ms))/\(f(s.arrivalToPresentedP95Ms)) requested->presented p50/p95 \(f(s.requestedToPresentedP50Ms))/\(f(s.requestedToPresentedP95Ms)) displayUpdates p50/p95/max \(f(s.displayUpdateIntervalP50Ms))/\(f(s.displayUpdateIntervalP95Ms))/\(f(s.displayUpdateIntervalMaxMs)) per s \(f(s.displayUpdatesPerSecond))")
+	log("DECODE latency avg/max(1 s) \(f(s.decodeTimeAvgMs))/\(f(s.decodeTimeMaxMs)) p50/p95 \(f(s.decodeLatencyP50Ms))/\(f(s.decodeLatencyP95Ms)) ms, in decoder max \(s.decoderInFlightMax)")
+	if !rssSamples.isEmpty { log("RSS MB: " + rssSamples.map { String(format: "%.0fs %.0f", $0.0, $0.1) }.joined(separator: ", ")) }
+	if !overlayUploadMs.isEmpty { let o = overlayUploadMs.sorted(); log(String(format: "overlay: %d updates, setOverlay med %.2f max %.2f ms (main thread)", o.count, o[o.count / 2], o.last!)) }
+}
 detectEval?.report()
 interpEval?.report()
 if opt.frameGen != .off {

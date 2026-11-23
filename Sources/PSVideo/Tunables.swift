@@ -60,6 +60,20 @@ struct TunableValues {
 	// Scaling (FrameScaler).
 	var scalerSharpness = 0.5
 	var scalerMetalFXHDRLinear = 1.0
+	// Presentation (MetalVideoRenderer).
+	var presentMode = 0.0
+	var presentDrawableCount = 3.0
+	var presentDisplaySync = 1.0
+	var presentCommitAheadMs = 6.0
+	var presentKeepAliveFraction = 0.9
+	var presentKeepAliveAllModes = 0.0
+	var presentKeepAliveStreamIntervals = 1.5
+	var presentFullLayer = 0.0
+	var presentHUD = 0.0
+	var presentSampleDisplayUpdates = 0.0
+	// In-frame overlay.
+	var overlayHDRWhiteNits = 100.0
+	var overlayOpacity = 1.0
 }
 
 final class Tunables: @unchecked Sendable {
@@ -122,6 +136,18 @@ final class Tunables: @unchecked Sendable {
 		Spec(name: "ex.overlayMaxCodes", key: \.exOverlayMaxCodes, range: 0...128, doc: "overlay guard: and static error per tap below this many 8-bit codes"),
 		Spec(name: "scaler.sharpness", key: \.scalerSharpness, range: 0...1, doc: "FSR 1 RCAS sharpening (0 = off, 1 = AMD maximum)"),
 		Spec(name: "scaler.metalFXHDRLinear", key: \.scalerMetalFXHDRLinear, range: 0...1, doc: "MetalFX on HDR: 1 = linear-light HDR mode, 0 = PQ values in perceptual mode"),
+		Spec(name: "present.mode", key: \.presentMode, range: 0...2, doc: "Metal presentation: 0 = paced grid (as before), 1 = lowest latency (each picture presented as soon as decoded, newest wins), 2 = smooth (presentAtTime at the pacer's continuous target)"),
+		Spec(name: "present.drawableCount", key: \.presentDrawableCount, range: 2...3, doc: "CAMetalLayer.maximumDrawableCount (2 = less buffering, may wait for a drawable)"),
+		Spec(name: "present.displaySync", key: \.presentDisplaySync, range: 0...1, doc: "CAMetalLayer.displaySyncEnabled (0 = may tear on non-VRR paths)"),
+		Spec(name: "present.commitAheadMs", key: \.presentCommitAheadMs, range: 0...50, doc: "modes 1/2: a timed picture is rendered and committed this long before its requested time (ms)"),
+		Spec(name: "present.keepAliveFraction", key: \.presentKeepAliveFraction, range: 0...1, doc: "re-present the last picture when nothing was presented for this x the panel's maximum refresh interval (0 = off; modes 1/2 unless keepAliveAllModes)"),
+		Spec(name: "present.keepAliveStreamIntervals", key: \.presentKeepAliveStreamIntervals, range: 0...10, doc: "and only when the stream is this many of its own intervals overdue (keeps re-presents out of normal jitter; 0 = panel limit only)"),
+		Spec(name: "present.keepAliveAllModes", key: \.presentKeepAliveAllModes, range: 0...1, doc: "1 = keep-alive also in mode 0"),
+		Spec(name: "present.fullLayer", key: \.presentFullLayer, range: 0...1, doc: "1 = direct-to-display layout: Metal layer covers the whole view at native pixels, letterbox drawn into the drawable, no painting PSVideo layers"),
+		Spec(name: "present.hud", key: \.presentHUD, range: 0...1, doc: "1 = Apple's Metal performance HUD on the video layer (developerHUDProperties)"),
+		Spec(name: "present.sampleDisplayUpdates", key: \.presentSampleDisplayUpdates, range: 0...1, doc: "1 = poll NSScreen.lastDisplayUpdateTimestamp (~2 kHz, background thread) for display-update cadence stats"),
+		Spec(name: "overlay.hdrWhiteNits", key: \.overlayHDRWhiteNits, range: 20...1000, doc: "in-frame overlay: luminance of overlay white on HDR output (nits; 100 = SDR reference white)"),
+		Spec(name: "overlay.opacity", key: \.overlayOpacity, range: 0...1, doc: "in-frame overlay: global opacity multiplier"),
 	]
 
 	private let lock = UnfairLock()

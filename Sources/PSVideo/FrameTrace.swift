@@ -28,6 +28,8 @@ enum TraceReason: Int, CaseIterable {
 	case slotShiftLater          // value = slots
 	case slotShiftEarlier
 	case cadenceChange           // value = new cadence (0 native, 1 fill, 2 doubling), limit = content fps
+	case keepAlive               // last picture re-presented to keep the panel in range; value = ms since the last present
+	case presentModeChange       // value = new present.mode
 
 	var name: String {
 		switch self {
@@ -53,6 +55,8 @@ enum TraceReason: Int, CaseIterable {
 		case .slotShiftLater: return "slot_shift_later"
 		case .slotShiftEarlier: return "slot_shift_earlier"
 		case .cadenceChange: return "cadence_change"
+		case .keepAlive: return "keep_alive"
+		case .presentModeChange: return "present_mode_change"
 		}
 	}
 }
@@ -73,6 +77,7 @@ struct TraceRecord {
 	var time = Double.nan   // when the record was made
 	// Frame.
 	var arrival = Double.nan
+	var submitted = Double.nan    // handed to VTDecompressionSession
 	var decoded = Double.nan
 	var target = Double.nan       // pacer target (or slot-clock time)
 	var delayMs = Double.nan      // pacer delay in force
@@ -150,7 +155,8 @@ final class FrameTrace: @unchecked Sendable {
 		"id": "record id (increasing)",
 		"seq": "stream frame number in decode order; for a slot, the real picture that closes the gap",
 		"t": "record creation time, host seconds (CACurrentMediaTime)",
-		"arrival": "frame arrival (host s)", "decoded": "decode finished (host s)",
+		"arrival": "frame arrival (host s)", "submitted": "handed to the decoder (host s)", "decoded": "decoder output (host s)",
+		"decode_ms": "decoder submit-to-output latency (ms)",
 		"target": "pacer target or slot-clock time (host s)", "delay_ms": "pacer delay in force (ms)",
 		"present_at": "requested present time (host s)", "committed": "handed to the GPU (host s)",
 		"presented": "on glass (host s, Metal path in a window)", "refreshes": "refreshes it stayed on screen",
@@ -180,7 +186,9 @@ final class FrameTrace: @unchecked Sendable {
 			switch r.kind {
 			case .frame:
 				o["type"] = "frame"
-				put("arrival", r.arrival); put("decoded", r.decoded); put("target", r.target); put("delay_ms", r.delayMs)
+				put("arrival", r.arrival); put("submitted", r.submitted); put("decoded", r.decoded)
+				if r.submitted.isFinite && r.decoded.isFinite { put("decode_ms", (r.decoded - r.submitted) * 1000) }
+				put("target", r.target); put("delay_ms", r.delayMs)
 				put("present_at", r.presentAt); put("committed", r.committed); put("presented", r.presented); put("refreshes", r.refreshes)
 				put("changed", r.value)
 				if r.flags.contains(.late) { o["late"] = true }

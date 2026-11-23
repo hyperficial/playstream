@@ -1,4 +1,5 @@
 import AppKit
+import Metal
 import CoreMedia
 import Foundation
 import PSContracts
@@ -487,6 +488,11 @@ public final class VideoPipeline: VideoStreamSink {
 		collector.switchMode(new.mode)
 		host?.setContentLayer(new.layer)
 		new.displayDidChange(screen: host?.window?.screen)
+		host?.setFullLayer(tunables.values.presentFullLayer >= 0.5 && mode == .metal)
+		if let m = new as? MetalVideoRenderer {
+			if let l = lastLayout { m.setLayout(boundsPx: l.0, contentRectPx: l.1, scale: l.2) }
+			if let o = overlayState { m.setOverlay(texture: o.texture, originPt: o.origin, sizePx: o.size) }
+		}
 		if streamLock.withLock({ streaming }) {
 			streamLock.withLock { requestKeyframe(force: true) }
 		}
@@ -495,12 +501,75 @@ public final class VideoPipeline: VideoStreamSink {
 	func attach(_ view: VideoView) {
 		dispatchPrecondition(condition: .onQueue(.main))
 		host = view
+		view.setFullLayer(tunables.values.presentFullLayer >= 0.5 && displayMode == .metal)
 		let (layer, fd) = rendererLock.withLock { (renderer.layer, lastConfig?.fd) }
 		view.setContentLayer(layer)
 		if let fd {
 			let d = CMVideoFormatDescriptionGetDimensions(fd)
 			view.setVideoSize(CGSize(width: Int(d.width), height: Int(d.height)))
 		}
+	}
+
+	private var lastLayout: (CGSize, CGRect, Double)?
+
+	/// The view's bounds and aspect-fit video rect in backing pixels (main thread).
+	func layoutChanged(boundsPx: CGSize, contentRectPx: CGRect, scale: Double) {
+		lastLayout = (boundsPx, contentRectPx, scale)
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.setLayout(boundsPx: boundsPx, contentRectPx: contentRectPx, scale: scale)
+	}
+
+	func nativeFullScreenChanged(_ on: Bool?) {
+		collector.update { $0.nativeFullScreen = on }
+	}
+
+	// MARK: In-frame overlay
+
+	private var overlayState: (texture: MTLTexture, origin: CGPoint, size: CGSize)?
+
+	/// Composites `image` into the video frame itself (Metal display mode), so the app does not need
+	/// views above the video layer (which would force the system to composite it instead of scanning it
+	/// out directly). `image` is drawn 1:1 in backing pixels (supply it at the window's backing scale),
+	/// premultiplied alpha, sRGB; on HDR output its white is `overlay.hdrWhiteNits`. `origin` is the
+	/// image's top-left corner in the video view's coordinate space (points, top-left origin).
+	/// Main thread; cheap enough to call a few times a second (one small texture upload). Pass nil to
+	/// remove it. The layer path (AVSampleBufferDisplayLayer) ignores the overlay.
+	public func setOverlay(_ image: CGImage?, origin: CGPoint) {
+		guard let image else { removeOverlay(); return }
+		let m = rendererLock.withLock { renderer } as? MetalVideoRenderer
+		guard let device = m?.device_ ?? MTLCreateSystemDefaultDevice() else { return }
+		let w = image.width, h = image.height
+		guard w > 0, h > 0, w <= 8192, h <= 8192 else { return }
+		var bytes = [UInt8](repeating: 0, count: w * h * 4)
+		let ok: Bool = bytes.withUnsafeMutableBytes { buf in
+			guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+			                          space: CGColorSpace(name: CGColorSpace.sRGB)!,
+			                          bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+			else { return false }
+			ctx.setBlendMode(.copy)
+			ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+			return true
+		}
+		guard ok else { return }
+		let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+		d.usage = [.shaderRead]
+		d.storageMode = .shared
+		guard let tex = device.makeTexture(descriptor: d) else { return }
+		bytes.withUnsafeBytes { tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: w * 4) }
+		// A new texture each time: frames in flight keep reading the previous one.
+		overlayState = (tex, origin, CGSize(width: w, height: h))
+		m?.setOverlay(texture: tex, originPt: origin, sizePx: CGSize(width: w, height: h))
+	}
+
+	/// Moves the overlay without re-uploading it (main thread).
+	public func moveOverlay(to origin: CGPoint) {
+		overlayState?.origin = origin
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.moveOverlay(to: origin)
+	}
+
+	/// Removes the overlay (main thread).
+	public func removeOverlay() {
+		overlayState = nil
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.setOverlay(texture: nil, originPt: .zero, sizePx: .zero)
 	}
 
 	/// The view laid out the video rect: its size in pixels (main thread).
@@ -657,6 +726,12 @@ extension VideoPipeline: VideoDebugControlling {
 
 	public func setDebugTunable(_ name: String, to value: Double) -> Bool {
 		guard tunables.set(name, value) else { return false }
+		if name == "present.fullLayer" {
+			onMain { [weak self] in
+				guard let self else { return }
+				self.host?.setFullLayer(value >= 0.5 && self.displayMode == .metal)
+			}
+		}
 		if name == "scaler.sharpness" { onMain { [weak self] in if let self, self.upscalerSharpness != value { self.upscalerSharpness = value } } }
 		return true
 	}
