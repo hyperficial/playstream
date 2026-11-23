@@ -179,11 +179,17 @@ final class MetalVideoRenderer: VideoRenderer {
 		}
 	}
 
+	func setFrameGenerationMethod(_ m: VideoFrameGenerationMethod) {
+		frameGenerationMethod = m
+		generator?.setMethod(m)
+	}
+	private var frameGenerationMethod: VideoFrameGenerationMethod = .extrapolate
+
 	func setMaxAddedLatency(_ seconds: Double) {
 		maxAddedLatency = seconds
 		generator?.maxAddedLatency = seconds
 	}
-	private var maxAddedLatency = 0.040
+	private var maxAddedLatency = 0.045
 
 	private func makeGenerator() -> FrameGenerator? {
 		let g = FrameGenerator(device: device, stats: stats)
@@ -193,6 +199,7 @@ final class MetalVideoRenderer: VideoRenderer {
 			return self.lock.withLock { self.shared.vsyncPeriod > 0 ? (self.shared.vsyncPhase, self.shared.vsyncPeriod) : nil }
 		}
 		g?.maxAddedLatency = maxAddedLatency
+		g?.setMethod(frameGenerationMethod)
 		return g
 	}
 
@@ -295,6 +302,13 @@ final class MetalVideoRenderer: VideoRenderer {
 	func interpolateScaledNow(prev: CVPixelBuffer, next: CVPixelBuffer, width: Int, height: Int) -> (CVPixelBuffer, Double)? {
 		if generator == nil { generator = makeGenerator() }
 		return generator?.interpolateScaledNow(prev: prev, next: next, width: width, height: height)
+	}
+
+	func extrapolateNow(prev: CVPixelBuffer, cur: CVPixelBuffer, factor: Float, force: Bool) -> (CVPixelBuffer?, String, Double, Float, Float, Float) {
+		if generator == nil { generator = makeGenerator() }
+		guard let g = generator else { return (nil, "unavailable", 0, 0, 0, 0) }
+		let r = g.extrapolateNow(prev: prev, cur: cur, factor: factor, force: force)
+		return (r.picture, r.decision, r.ms, r.motion?.meanMotion ?? 0, r.motion?.fieldChange ?? 0, r.motion?.residualRatio ?? 0)
 	}
 
 	func analyzeNow(_ pb: CVPixelBuffer, previous: CVPixelBuffer?) -> (changed: Float, hist: [Float])? {

@@ -69,16 +69,29 @@ public final class VideoPipeline: VideoStreamSink {
 	private var frameGenerationSetting: VideoFrameGeneration = .off
 
 	/// Latency-versus-smoothness control for frame generation: the most extra delay (ms) the generator
-	/// may add over the non-generating paced path. Default 40. 30 -> 60 needs about half a content
-	/// interval (16.7 ms) + interpolation time (~10-15 ms) + jitter; below that, more in-between pictures
-	/// miss their slot and the repeat is shown instead (`stats.frameGenerationFallbacks` rises).
+	/// may add over the non-generating paced path (interpolation only; extrapolation adds none). Default 45.
+	/// Needed: jitter allowance + half a content interval (16.7 ms at 30 fps) + interpolation p95 (~15 ms) +
+	/// 12 ms commit margin, minus the pacing delay the non-generating path already has: about 34 ms on a
+	/// link with ~10 ms jitter. Below that, in-between pictures miss their slot and the repeat is shown
+	/// instead (`stats.frameGenerationFallbacks` rises).
 	/// Main thread.
-	public var frameGenerationMaxAddedLatencyMs: Double = 40 {
+	public var frameGenerationMaxAddedLatencyMs: Double = 45 {
 		didSet {
 			dispatchPrecondition(condition: .onQueue(.main))
 			frameGenerationMaxAddedLatencyMs = max(0, frameGenerationMaxAddedLatencyMs)
 			(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.setMaxAddedLatency(frameGenerationMaxAddedLatencyMs / 1000)
 			collector.update { $0.frameGenerationMaxAddedLatencyMs = self.frameGenerationMaxAddedLatencyMs }
+		}
+	}
+
+	/// How in-between pictures are made (main thread). Default `.extrapolate`: no added input delay.
+	/// `.interpolate` is smoother and more correct but adds about half a content interval + interpolation
+	/// time (see `frameGenerationMaxAddedLatencyMs`).
+	public var frameGenerationMethod: VideoFrameGenerationMethod = .extrapolate {
+		didSet {
+			dispatchPrecondition(condition: .onQueue(.main))
+			(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.setFrameGenerationMethod(frameGenerationMethod)
+			collector.update { $0.frameGenerationMethod = self.frameGenerationMethod }
 		}
 	}
 
@@ -326,7 +339,7 @@ public final class VideoPipeline: VideoStreamSink {
 		let a = pacer.arrivalStats()
 		let paced = mode == .adaptive
 		let delay = pacer.delay, target = pacer.targetDelay, fps = 1 / pacer.interval
-		let late = lateFrames, skipped = skippedFrames
+		let late = lateFrames, skipped = skippedFrames, rebases = pacer.rebases
 		collector.update { s in
 			s.pacingMode = mode
 			s.streamFPS = fps
@@ -337,6 +350,7 @@ public final class VideoPipeline: VideoStreamSink {
 			s.playoutTargetDelayMs = paced ? target * 1000 : 0
 			s.framesLate = late
 			s.framesSkipped = skipped
+			s.pacerRebases = rebases
 		}
 	}
 
@@ -410,6 +424,7 @@ public final class VideoPipeline: VideoStreamSink {
 		new.setPacing(pacingMode)
 		new.setUpscaler(upscalerSetting)
 		(new as? MetalVideoRenderer)?.setMaxAddedLatency(frameGenerationMaxAddedLatencyMs / 1000)
+		(new as? MetalVideoRenderer)?.setFrameGenerationMethod(frameGenerationMethod)
 		new.setFrameGeneration(frameGenerationSetting)
 		new.setOutputPixelSize(contentPixelSize)
 		if let o = outputOverride, let m = new as? MetalVideoRenderer { m.setOutputOverride(o) }
@@ -476,10 +491,40 @@ public final class VideoPipeline: VideoStreamSink {
 		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.interpolateNow(prev: prev, next: next)
 	}
 
+	/// Diagnostics: runs the pacer over synthetic arrival times (seconds) without real-time scheduling.
+	/// Returns per frame (target, applied delay, late, skip) and the number of grid re-bases.
+	@_spi(Diagnostics)
+	public static func simulatePacing(arrivals: [Double], fps: Int, minDelayMs: Double, maxDelayMs: Double, robust: Bool = true)
+		-> (frames: [(target: Double, delay: Double, late: Bool, skip: Bool)], rebases: Int)
+	{
+		let p = FramePacer()
+		p.robustOutliers = robust
+		p.reset(fps: fps)
+		p.minDelay = minDelayMs / 1000
+		p.maxDelay = maxDelayMs / 1000
+		var out: [(Double, Double, Bool, Bool)] = []
+		for a in arrivals {
+			let s = p.schedule(arrival: a, framesLost: 0)
+			out.append((s.target ?? a, s.pacerDelay, s.late, s.skip))
+		}
+		return (out.map { (target: $0.0, delay: $0.1, late: $0.2, skip: $0.3) }, p.rebases)
+	}
+
 	/// Diagnostics: interpolation at reduced resolution (scaled back to full size).
 	@_spi(Diagnostics)
 	public func interpolateScaledOffscreen(prev: CVPixelBuffer, next: CVPixelBuffer, width: Int, height: Int) -> (CVPixelBuffer, Double)? {
 		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.interpolateScaledNow(prev: prev, next: next, width: width, height: height)
+	}
+
+	/// Diagnostics: motion-extrapolated picture half an interval after `cur` (factor 0.5), with the
+	/// decision, total ms, mean motion (px), field change (px), residual ratio.
+	@_spi(Diagnostics)
+	public func extrapolateOffscreen(prev: CVPixelBuffer, cur: CVPixelBuffer, factor: Float = 0.5, force: Bool = false)
+		-> (picture: CVPixelBuffer?, decision: String, ms: Double, motion: Float, change: Float, residual: Float)
+	{
+		guard let r = rendererLock.withLock({ renderer }) as? MetalVideoRenderer else { return (nil, "not metal", 0, 0, 0, 0) }
+		let x = r.extrapolateNow(prev: prev, cur: cur, factor: factor, force: force)
+		return (x.0, x.1, x.2, x.3, x.4, x.5)
 	}
 
 	/// Diagnostics: frame generation's picture analysis (changed-pixel fraction, luma histogram).

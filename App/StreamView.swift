@@ -211,7 +211,7 @@ private struct StatsOverlay: View {
 				row("Upscale", "\(stats.video.activeUpscaler.rawValue) to \(stats.video.upscaleOutputWidth)×\(stats.video.upscaleOutputHeight)")
 			}
 			if stats.video.frameGeneration != .off {
-				row("Frame gen", String(format: "%@  game %.0f fps  +%.0f/s  hold %.0f ms", stats.video.frameGenerationState, stats.video.contentFPS, stats.video.generatedFPS, stats.video.frameGenerationAddedLatencyMs))
+				row("Frame gen", String(format: "%@  game %.0f fps  +%.0f/s  hold %.0f ms", "\(stats.video.frameGenerationMethod)", stats.video.contentFPS, stats.video.generatedFPS, stats.video.frameGenerationAddedLatencyMs))
 			}
 			if let decode = stats.video.decodeTimeAvgMs {
 				row("Decode", String(format: "%.1f ms", decode))

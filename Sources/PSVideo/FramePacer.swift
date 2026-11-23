@@ -60,6 +60,13 @@ final class FramePacer {
 	private var k: Int64 = 0
 	private var base = 0.0
 	private var lastArrival = 0.0
+	private var slipRun: [Double] = []
+	private var lastTarget = -Double.infinity
+	/// Outlier handling (ignore whole-interval lateness in the estimator, re-base on slips). Diagnostics
+	/// can turn it off to compare with the previous behaviour.
+	var robustOutliers = true
+	/// Times the grid was re-based because the console's frame timeline slipped.
+	private(set) var rebases = 0
 	private var startArrival = 0.0
 	private(set) var delay = 1.0 / 60
 	private(set) var targetDelay = 1.0 / 60
@@ -88,6 +95,8 @@ final class FramePacer {
 
 	private func restartGrid() {
 		started = false
+		lastTarget = -Double.infinity
+		slipRun.removeAll()
 		offsets.removeAll()
 		lateness.removeAll()
 		delay = minDelay
@@ -124,10 +133,33 @@ final class FramePacer {
 		offsets.push(o, limit: analysisFrames)
 		base = offsets.minimum()
 		if detectFrameRate() { return schedule(arrival: a, framesLost: lost) }
-		let late = max(0, o - base)
+		var late = max(0, o - base)
+		// A frame late by most of an interval or more is not jitter: the console did not deliver a frame
+		// for a tick (its timeline slipped), or the network stalled. A playout delay shorter than a frame
+		// cannot hide either, so such samples do not feed the delay estimator; the frame is handled as late.
+		// At 30 fps (or lower) a slip is one whole interval, longer than any useful delay. At 60 fps the
+		// maximum delay can cover a couple of frames of jitter, so only lateness the buffer could never
+		// absorb counts as an outlier there.
+		let lowRate = interval > 1.0 / 45
+		let outlier = robustOutliers && late >= 0.75 * interval && (lowRate || late >= 0.75 * maxDelay)
+		if outlier {
+			slipRun.append(late)
+			if slipRun.count >= 2, let lo = slipRun.min(), let hi = slipRun.max(), hi - lo < 0.25 * interval {
+				// Two frames in a row late by the same amount: the console's timeline moved. Re-base the grid
+				// on the new timeline at once (instead of after the 2 s window).
+				offsets.removeAll()
+				offsets.push(o, limit: analysisFrames)
+				base = o
+				late = 0
+				slipRun.removeAll()
+				rebases += 1
+			}
+		} else {
+			slipRun.removeAll()
+		}
 		// Stream start (decoder creation, first IDR) delays the first frames once; don't let that
 		// one-off set the playout delay for the next seconds. Late frames still re-anchor below.
-		lateness.push(a - startArrival < 0.5 ? 0 : late, limit: analysisFrames)
+		if !outlier { lateness.push(a - startArrival < 0.5 ? 0 : late, limit: analysisFrames) }
 
 		// Target delay from the lateness distribution.
 		let p = lateness.percentile(percentile, scratch: &scratch) + margin
@@ -141,7 +173,17 @@ final class FramePacer {
 
 		// Applied delay.
 		var isLate = false
-		if late > delay + 0.0005 {
+		if outlier {
+			// Whole-interval late (console skipped a frame, or a stall): leave the delay alone and show the
+			// frame `delay` after its actual arrival, as if its timeline had moved. Burst frames behind it
+			// that would land on an already-shown picture are skipped below. No latency is added afterwards.
+			isLate = true
+			let target = a + delay
+			let skip = target < lastTarget + 0.25 * interval
+			if !skip { lastTarget = target }
+			return FrameSchedule(target: target, skip: skip, late: true, interval: interval, grid: base + Double(k) * interval,
+			                     jitter: min(lateness.percentile(percentile, scratch: &scratch) + margin, maxDelay), pacerDelay: delay)
+		} else if late > delay + 0.0005 {
 			isLate = true
 			delay = late // shown at once; the grid re-anchors on this frame
 		} else if delay < targetDelay {
@@ -161,7 +203,14 @@ final class FramePacer {
 			delay -= interval
 		}
 		let grid = base + Double(k) * interval
-		let target = max(a, grid + delay)
+		var target = max(a, grid + delay)
+		// Never land on (or before) the picture just shown: such a frame is part of a burst after a stall.
+		if target < lastTarget + 0.25 * interval {
+			skip = true
+		} else {
+			lastTarget = target
+		}
+		if skip { target = max(target, lastTarget) }
 		return FrameSchedule(target: target, skip: skip, late: isLate, interval: interval, grid: grid, jitter: min(p, maxDelay), pacerDelay: target - grid)
 	}
 

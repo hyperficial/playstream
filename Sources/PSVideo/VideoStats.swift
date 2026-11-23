@@ -82,6 +82,8 @@ public struct VideoStats: Sendable, Equatable {
 	public var framesLate: Int = 0
 	/// Frames decoded but not shown to catch up after a long stall.
 	public var framesSkipped: Int = 0
+	/// Times the pacing grid was re-based because the console's frame timeline slipped (it skipped a frame).
+	public var pacerRebases: Int = 0
 	/// How far ahead of its target a paced frame is handed to the system so it can make that vsync,
 	/// ms. Learned from feedback (Metal: presented-time misses; layer: the layer's own frame-delay
 	/// metric). This is pipeline latency the immediate path pays as well, not extra buffering.
@@ -135,8 +137,15 @@ public struct VideoStats: Sendable, Equatable {
 	public var frameGenerationSlotShifts: Int = 0
 	/// Real pictures that arrived too late for their slot (the grid moved later).
 	public var frameGenerationLateReal: Int = 0
-	/// Most extra delay the generator may add over the non-generating paced path, ms (setting).
-	public var frameGenerationMaxAddedLatencyMs: Double = 40
+	/// Most extra delay the generator may add over the non-generating paced path, ms (setting; interpolation).
+	public var frameGenerationMaxAddedLatencyMs: Double = 45
+	public var frameGenerationMethod: VideoFrameGenerationMethod = .extrapolate
+	/// Extrapolation: slots where the motion was not trustworthy (changing, low confidence) and the real
+	/// picture stayed on screen instead (included in `frameGenerationFallbacks`).
+	public var frameGenerationRejectedMotion: Int = 0
+	/// Extrapolation: motion estimation and warp time of the last generated picture, ms.
+	public var frameGenerationMotionMs: Double = 0
+	public var frameGenerationWarpMs: Double = 0
 
 	// MARK: On-screen cadence (Metal path, from the drawables' presented times; nil on the layer path)
 

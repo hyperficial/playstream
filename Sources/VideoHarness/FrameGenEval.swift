@@ -48,6 +48,7 @@ final class InterpEval {
 	private let dump: String?
 	private var dumped = Set<Int>()
 	private var maxHistNormal: Float = 0
+	private var extrapStats: [(psnr: Double, hud: Double, pan: Double, ms: Double, accepted: Bool, decision: String, motion: Float, change: Float, residual: Float, idx: Int)] = []
 	private var halfStats: [(psnr: Double, ms: Double, sharpHalf: Double, sharpFull: Double)] = []
 
 	init(dumpDir: String?) { dump = dumpDir }
@@ -55,10 +56,10 @@ final class InterpEval {
 	func frame(_ pb: CVPixelBuffer) {
 		idx += 1
 		frames.append(pb)
-		if frames.count > 3 { frames.removeFirst() }
-		// Evaluate pairs (k-2, k) with truth k-1, k even, every 4th pair to keep up.
-		guard idx >= 2, idx % 2 == 0, idx % 8 == 0 || idx == 120 || idx == 122, frames.count == 3 else { return }
-		let a = frames[0], truth = frames[1], b = frames[2]
+		if frames.count > 5 { frames.removeFirst() }
+		// Evaluate truth k-1: interpolated from (k-2, k), extrapolated from (k-4, k-2), every 4th pair.
+		guard idx >= 4, idx % 2 == 0, idx % 8 == 0 || idx == 120 || idx == 122 || idx == 124, frames.count == 5 else { return }
+		let pp = frames[0], a = frames[2], truth = frames[3], b = frames[4]
 		guard let (gen, ms) = pipeline.interpolateOffscreen(prev: a, next: b),
 		      let rg = pipeline.renderOffscreen(pixelBuffer: gen), let rt = pipeline.renderOffscreen(pixelBuffer: truth),
 		      let ra = pipeline.renderOffscreen(pixelBuffer: a), let rb = pipeline.renderOffscreen(pixelBuffer: b)
@@ -95,6 +96,28 @@ final class InterpEval {
 				return e
 			}
 			halfStats.append((psnr(rh.rgba, rt.rgba), hms, edge(rh.rgba) / max(1e-9, edge(rt.rgba)), edge(rg.rgba) / max(1e-9, edge(rt.rgba))))
+		}
+		if ProcessInfo.processInfo.environment["PSV_SIGN_TEST"] != nil && idx % 16 == 0 {
+			var line = "sign test truth \(idx - 1):"
+			for f: Float in [0.5, -0.5, 0, 1.0] {
+				if let p = pipeline.extrapolateOffscreen(prev: pp, cur: a, factor: f, force: true).picture, let r = pipeline.renderOffscreen(pixelBuffer: p) {
+					line += String(format: " f=%.1f %.2f dB (pan %.2f)", f, psnr(r.rgba, rt.rgba), psnr(r.rgba, rt.rgba, (300, 300, 1200, 500)))
+				}
+			}
+			if let r = pipeline.renderOffscreen(pixelBuffer: b) { line += String(format: " | next real (k) vs truth %.2f", psnr(r.rgba, rt.rgba)) }
+			log(line)
+		}
+		// Extrapolation (no added delay): predicted from the two real pictures before the truth.
+		let ex = pipeline.extrapolateOffscreen(prev: pp, cur: a)
+		let exForced = ex.picture == nil ? pipeline.extrapolateOffscreen(prev: pp, cur: a, force: true) : ex
+		if let pic = exForced.picture, let re = pipeline.renderOffscreen(pixelBuffer: pic) {
+			extrapStats.append((psnr(re.rgba, rt.rgba), psnr(re.rgba, rt.rgba, (1580, 0, 340, 400)), psnr(re.rgba, rt.rgba, (300, 300, 1200, 500)),
+			                    ex.ms, ex.picture != nil, ex.decision, ex.motion, ex.change, ex.residual, idx))
+			if let dir = dump, [38, 118, 158].contains(idx - 2) {
+				let hdr = pipeline.colorInfo?.isHDR ?? false
+				let crops: [(String, (x: Int, y: Int, w: Int, h: Int))] = [("hud", (1500, 0, 420, 420)), ("pan", (500, 380, 640, 360)), ("text", (0, 20, 900, 120))]
+				dumpCrops(re.rgba, width: W, height: rt.height, hdr: hdr, crops: crops, prefix: "\(dir)/fg_\(hdr ? "hdr" : "sdr")_k\(idx - 2)_extrapolated")
+			}
 		}
 		let hud = (1580, 0, 340, 400)   // minimap with moving marker + timer (top-right)
 		let pan = (300, 300, 1200, 500) // panning background
@@ -133,6 +156,25 @@ final class InterpEval {
 		log(String(format: "  panning background: generated %.2f dB | repeat %.2f dB", avg { $0.genPan }, avg { $0.repPan }))
 		log(String(format: "  worst pair: generated %.2f dB (k=%d)", results.map { $0.gen }.min()!, results.min { $0.gen < $1.gen }!.k))
 		log(String(format: "  interpolation time incl. 8-bit conversion: median %.2f ms, max %.2f ms", ms[ms.count / 2], ms.last!))
+		if !extrapStats.isEmpty {
+			let normal = extrapStats.filter { ![120, 122, 124].contains($0.idx) }
+			let acc = normal.filter { $0.accepted }
+			let n = Double(max(1, normal.count))
+			let t = normal.map { $0.ms }.sorted()
+			log(String(format: "  extrapolated (no added delay), all %d pairs incl. rejected (forced): whole %.2f dB, HUD %.2f dB, pan %.2f dB; motion+warp %.2f ms median, %.2f max",
+			           normal.count, normal.map { $0.psnr }.reduce(0, +) / n, normal.map { $0.hud }.reduce(0, +) / n, normal.map { $0.pan }.reduce(0, +) / n, t[t.count / 2], t.last ?? 0))
+			if !acc.isEmpty {
+				log(String(format: "  extrapolation accepted %d of %d (rejected: %@); accepted only: whole %.2f dB",
+				           acc.count, normal.count, Dictionary(grouping: normal.filter { !$0.accepted }, by: { $0.decision }).map { "\($0.key) \($0.value.count)" }.joined(separator: ", "),
+				           acc.map { $0.psnr }.reduce(0, +) / Double(acc.count)))
+			}
+			for e in extrapStats where [120, 122, 124].contains(e.idx) {
+				log(String(format: "  extrapolation around the cut (truth %d): %@, %.2f dB (motion %.1f px, change %.1f px, residual %.2f)", e.idx - 1, e.decision, e.psnr, e.motion, e.change, e.residual))
+			}
+			let m = normal.map { $0.motion }.reduce(0, +) / Float(n)
+			let c = normal.map { $0.change }.reduce(0, +) / Float(n)
+			log(String(format: "  motion field: mean %.1f px/interval, mean change between intervals %.1f px, residual ratio %.2f", m, c, normal.map { $0.residual }.reduce(0, +) / Float(n)))
+		}
 		if !halfStats.isEmpty {
 			let n = Double(halfStats.count)
 			let t = halfStats.map { $0.ms }.sorted()

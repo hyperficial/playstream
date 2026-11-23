@@ -59,6 +59,7 @@ final class StreamController: ObservableObject {
 		self.video.upscaler = wanted.upscaler
 		self.video.frameGeneration = wanted.frameGeneration
 		self.video.frameGenerationMaxAddedLatencyMs = settings.frameGenerationMaxDelay
+		self.video.frameGenerationMethod = settings.frameGenerationMethod == 1 ? .interpolate : .extrapolate
 		// Adaptive jitter buffer: 40 ms on a clean link, growing by itself when the link stalls.
 		self.audio = AudioPipeline(configuration: AudioPipelineConfiguration())
 	}
@@ -138,6 +139,11 @@ final class StreamController: ObservableObject {
 			video.frameGeneration = wanted.frameGeneration
 			changes.append("frame generation \(wanted.frameGeneration.rawValue)")
 		}
+		let method: VideoFrameGenerationMethod = settings.frameGenerationMethod == 1 ? .interpolate : .extrapolate
+		if video.frameGenerationMethod != method {
+			video.frameGenerationMethod = method
+			changes.append("frame generation method \(method)")
+		}
 		if video.frameGenerationMaxAddedLatencyMs != settings.frameGenerationMaxDelay {
 			video.frameGenerationMaxAddedLatencyMs = settings.frameGenerationMaxDelay
 			changes.append("frame generation budget \(Int(settings.frameGenerationMaxDelay)) ms")
@@ -194,7 +200,7 @@ final class StreamController: ObservableObject {
 					+ " | refreshes \(v.presentedRefreshHistogram) offcadence \(v.presentedOffCadence) panel \(ms(v.displayRefreshHz)) Hz"
 					+ " | queue \(v.pacedQueueDepthMax) drawablewait \(ms(v.drawableWaitMaxMs)) ms glass \(ms(v.glassAvgMs)) ms"
 					+ " | upscaler \(v.activeUpscaler.rawValue) \(v.upscaleOutputWidth)x\(v.upscaleOutputHeight) gpu \(ms(v.renderGPUTimeAvgMs))/\(ms(v.renderGPUTimeMaxMs)) ms scaler \(ms(v.scalerGPUTimeAvgMs)) ms"
-					+ " | framegen \(v.frameGeneration.rawValue) state \(v.frameGenerationState) content \(String(format: "%.0f", v.contentFPS)) fps generated \(String(format: "%.0f", v.generatedFPS))/s total \(v.framesGenerated) fallbacks \(v.frameGenerationFallbacks) cuts \(v.frameGenerationCutsSkipped) hold \(ms(v.frameGenerationAddedLatencyMs))/\(ms(v.frameGenerationMaxAddedLatencyMs)) ms time \(ms(v.frameGenerationTimeMs)) ms convert \(ms(v.frameGenerationConvertMs)) ms guard \(ms(v.frameGenerationGuardMs)) ms slotshifts \(v.frameGenerationSlotShifts) latereal \(v.frameGenerationLateReal)"
+					+ " | framegen \(v.frameGeneration.rawValue) \(v.frameGenerationMethod) state \(v.frameGenerationState) content \(String(format: "%.0f", v.contentFPS)) fps generated \(String(format: "%.0f", v.generatedFPS))/s total \(v.framesGenerated) fallbacks \(v.frameGenerationFallbacks) cuts \(v.frameGenerationCutsSkipped) hold \(ms(v.frameGenerationAddedLatencyMs))/\(ms(v.frameGenerationMaxAddedLatencyMs)) ms time \(ms(v.frameGenerationTimeMs)) ms convert \(ms(v.frameGenerationConvertMs)) ms guard \(ms(v.frameGenerationGuardMs)) ms slotshifts \(v.frameGenerationSlotShifts) latereal \(v.frameGenerationLateReal) rejectedmotion \(v.frameGenerationRejectedMotion) motion \(ms(v.frameGenerationMotionMs)) ms warp \(ms(v.frameGenerationWarpMs)) ms | pacer rebases \(v.pacerRebases)"
 			)
 		}
 		CoreLog.note(String(

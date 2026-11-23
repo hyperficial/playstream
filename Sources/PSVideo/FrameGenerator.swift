@@ -18,6 +18,19 @@ public enum VideoFrameGeneration: String, Sendable, CaseIterable, Codable {
 	case to120
 }
 
+/// How in-between pictures are made.
+public enum VideoFrameGenerationMethod: String, Sendable, CaseIterable, Codable {
+	/// Predict the next in-between picture from the motion between the last two real pictures and show
+	/// it half a content interval after the current one. Real pictures are shown exactly when the
+	/// non-generating path would show them: no added input delay. Artefacts where motion changes
+	/// (stops, reverses) and at disocclusions; such slots fall back to the real picture.
+	case extrapolate
+	/// Interpolate between two real pictures (VideoToolbox ML interpolator). Smoothest and most correct,
+	/// but every real picture waits for the next one: about half a content interval + interpolation time
+	/// of added delay.
+	case interpolate
+}
+
 /// One picture handed to the display queue.
 struct GeneratedEmit {
 	enum Kind { case real, generated, fallbackRepeat }
@@ -54,7 +67,13 @@ final class FrameGenerator {
 	var vsync: (() -> (phase: Double, period: Double)?)?
 	/// Most extra delay over the non-generating paced path the generator may use. Below what the
 	/// interpolation needs, more in-between pictures miss their slot and fall back.
-	var maxAddedLatency = 0.040
+	var maxAddedLatency = 0.045
+	/// Extrapolate (no added delay) or interpolate.
+	var method: VideoFrameGenerationMethod = .extrapolate
+	private lazy var extrapolator: MotionExtrapolator? = MotionExtrapolator(device: device)
+	private var lastMotion: MotionExtrapolator.Motion?
+	private var extrapolated = 0, extrapolationRejected = 0
+	private var motionMs = 0.0, warpMs = 0.0
 
 	var emit: ((GeneratedEmit) -> Void)?
 	private let queue = DispatchQueue(label: "PSVideo.framegen", qos: .userInteractive)
@@ -203,6 +222,18 @@ final class FrameGenerator {
 		}
 	}
 
+	func setMethod(_ m: VideoFrameGenerationMethod) {
+		queue.async {
+			guard self.method != m else { return }
+			self.flushSlots()
+			self.method = m
+			self.clock = nil
+			self.extrapolatedFor = nil
+			self.extrapolator?.resetHistory()
+			self.publish()
+		}
+	}
+
 	func reset() {
 		queue.async {
 			self.flushSlots()
@@ -253,7 +284,7 @@ final class FrameGenerator {
 		// 3. Slot clock while generating; none otherwise (pictures keep the pacer's targets).
 		stoppedState = false
 		let generating = cadence != .native && processor != nil
-		if generating { updateClock(input) } else { clock = nil; addedLatency = 0 }
+		if generating && method == .interpolate { updateClock(input) } else { clock = nil; addedLatency = 0 }
 
 		if input.skip {
 			// Pacer catch-up: keep as reference, don't show.
@@ -265,6 +296,16 @@ final class FrameGenerator {
 		if CACurrentMediaTime() - lastPublish > 0.25 { publish() }
 
 		// 4. Routing.
+		if isRepeat && generating && method == .extrapolate {
+			// The slot of this repeat already got a predicted picture: drop it; otherwise show it (fallback).
+			if extrapolatedFor != lastNew?.index || extrapolatedFor == nil {
+				appendReal(input, index: idx)
+				drain()
+			}
+			extrapolatedFor = nil
+			lastPicture = pic
+			return
+		}
 		if isRepeat {
 			let lastSlotWaits = slots.last.map { $0.isGen && !$0.done && $0.next == nil } ?? false
 			if lastSlotWaits, let w = slots.last {
@@ -282,9 +323,27 @@ final class FrameGenerator {
 			return
 		}
 
-		// New picture. Needs an 8-bit copy for the interpolator.
+		// Cut? Histogram first (cheap); only a candidate is checked with motion estimation, so fast pans
+		// and frames after a gap (explained by motion) are not taken for cuts.
+		var motion: MotionExtrapolator.Motion?
+		var isCut = lastNew == nil
+		if let prev = lastNew, generating {
+			let d = histDistance(prev.hist, hist)
+			if d > cutHistDistance || method == .extrapolate {
+				motion = extrapolator?.estimate(prev: prev.buffer, cur: input.buffer)
+			}
+			isCut = self.isCut(histDistance: d, motion: motion)
+		}
+
+		if generating && method == .extrapolate {
+			extrapolateAfter(input: input, pic: pic, index: idx, motion: motion, isCut: isCut)
+			lastPicture = pic
+			lastNew = pic
+			return
+		}
+
+		// Interpolation needs an 8-bit copy of the picture.
 		if generating { pic.buffer8 = to8bit(input.buffer) }
-		let isCut = lastNew.map { histDistance($0.hist, hist) > cutHistDistance } ?? true
 		if cadence == .doubling && generating, let prev = lastNew, prev.index == lastPicture?.index {
 			// Gap between two consecutive new pictures (30 fps stream, or 60 -> 120): the slot just
 			// before this picture's. If frames were lost in between there is no single gap slot.
@@ -306,6 +365,48 @@ final class FrameGenerator {
 		lastNew = pic
 		kickInterpolation()
 		drain()
+	}
+
+	// MARK: Extrapolation (no added delay)
+
+	private var extrapolatedFor: Int?
+
+	/// The real picture is emitted at once at its normal target; the predicted picture follows half a
+	/// content interval later (doubling) or in the next stream slot (fill), if the motion is trustworthy.
+	private func extrapolateAfter(input: Input, pic: Picture, index idx: Int, motion: MotionExtrapolator.Motion?, isCut: Bool) {
+		appendReal(input, index: idx)
+		drain()
+		extrapolatedFor = nil
+		guard let prev = lastNew, let ex = extrapolator else { return }
+		if isCut || input.discontinuity || prev.input.discontinuity {
+			if isCut { cutsSkipped += 1 }
+			fallbacks += 1
+			ex.resetHistory()
+			return
+		}
+		guard let m = motion ?? ex.estimate(prev: prev.buffer, cur: input.buffer) else { fallbacks += 1; return }
+		motionMs = m.ms
+		let (ok, _) = Self.extrapolationAllowed(m)
+		guard ok else {
+			extrapolationRejected += 1
+			fallbacks += 1
+			return
+		}
+		let tOut = cadence == .doubling ? input.interval / 2 : input.interval
+		let span = max(tOut, input.grid - prev.input.grid)
+		let target = input.target + tOut
+		let t0 = CACurrentMediaTime()
+		guard t0 < target - commitMargin, let g = ex.warp(cur: input.buffer, prev: prev.buffer, factor: Float(tOut / span)) else {
+			fallbacks += 1
+			return
+		}
+		warpMs = (CACurrentMediaTime() - t0) * 1000
+		guard CACurrentMediaTime() < target - commitMargin else { fallbacks += 1; return }
+		emit?(GeneratedEmit(buffer: g, arrival: input.arrival, target: target, interval: tOut, kind: .generated, sourceIndex: idx))
+		generated += 1
+		genWindowCount += 1
+		extrapolated += 1
+		extrapolatedFor = idx
 	}
 
 	// MARK: Slot clock
@@ -357,7 +458,13 @@ final class FrameGenerator {
 		guard var c = clock else { return }
 		let o = slotIndex(i.grid)
 		let slack = displayTime(o) - commitMargin - now
-		if slack < 0 {
+		let contentInterval = 2 * periodOut
+		if slack < 0 && -slack > 0.6 * contentInterval {
+			// Late by most of a content interval: a frame the console did not deliver, or a network stall.
+			// Moving the grid would add that much latency for good; show it late (one hitch) and keep the
+			// grid. The pacer re-bases its grid when the console's timeline really slipped.
+			lateReal += 1
+		} else if slack < 0 {
 			// This real picture would miss its slot: move the whole grid later by whole slots.
 			let n = (-slack / c.slotDur).rounded(.up)
 			c.anchorDisplay += n * c.slotDur
@@ -726,6 +833,7 @@ final class FrameGenerator {
 		}
 		let (m, c, cf, g, fb, cut, extra) = (mode, cadence, contentFPS, generated, fallbacks, cutsSkipped, addedLatency)
 		let (shifts, late, conv, grd, stopped) = (slotShifts, lateReal, convertMs, guardMs, stoppedState)
+		let (meth, rej, mms, wms) = (method, extrapolationRejected, motionMs, warpMs)
 		stats.update { s in
 			s.frameGeneration = m
 			s.frameGenerationState = stopped ? "stopped" : c.rawValue
@@ -733,6 +841,10 @@ final class FrameGenerator {
 			s.frameGenerationLateReal = late
 			s.frameGenerationConvertMs = conv
 			s.frameGenerationGuardMs = grd
+			s.frameGenerationMethod = meth
+			s.frameGenerationRejectedMotion = rej
+			s.frameGenerationMotionMs = mms
+			s.frameGenerationWarpMs = wms
 			s.contentFPS = cf
 			s.framesGenerated = g
 			s.frameGenerationFallbacks = fb
@@ -829,6 +941,38 @@ final class FrameGenerator {
 	private var scaledSrcAttrs: [String: Any] = [:]
 	private var scaledDstAttrs: [String: Any] = [:]
 	private var transfer: VTPixelTransferSession?
+
+	/// Extrapolation is allowed only when the motion is trustworthy: motion explains the change
+	/// (residual), and the field did not change much since the last interval (otherwise the prediction
+	/// overshoots where motion stops or reverses).
+	static func extrapolationAllowed(_ m: MotionExtrapolator.Motion) -> (Bool, String) {
+		if m.residualRatio > 0.75 { return (false, "low confidence") }
+		if !m.hasPreviousField { return (false, "no motion history") }
+		if m.fieldChange > max(6, 0.5 * m.meanMotion) { return (false, "motion changing") }
+		return (true, "ok")
+	}
+
+	/// A cut: the histogram changed a lot AND motion cannot explain the change (a fast pan or a frame
+	/// after a gap changes the histogram little or is explained by motion).
+	func isCut(histDistance d: Float, motion: MotionExtrapolator.Motion?) -> Bool {
+		guard d > cutHistDistance else { return false }
+		guard let m = motion else { return d > 1.0 }
+		return m.residualRatio > 0.6 || d > 1.2
+	}
+
+	/// Diagnostics: extrapolate from (prev, cur) by `factor` (0.5 = half an interval ahead), synchronously.
+	func extrapolateNow(prev: CVPixelBuffer, cur: CVPixelBuffer, factor: Float = 0.5, force: Bool = false)
+		-> (picture: CVPixelBuffer?, decision: String, motion: MotionExtrapolator.Motion?, ms: Double)
+	{
+		queue.sync {
+			let t0 = CACurrentMediaTime()
+			guard let ex = extrapolator, let m = ex.estimate(prev: prev, cur: cur) else { return (nil, "unavailable", nil, 0) }
+			let (ok, why) = Self.extrapolationAllowed(m)
+			guard ok || force else { return (nil, why, m, (CACurrentMediaTime() - t0) * 1000) }
+			let pic = ex.warp(cur: cur, prev: prev, factor: factor)
+			return (pic, ok ? "ok" : "forced (\(why))", m, (CACurrentMediaTime() - t0) * 1000)
+		}
+	}
 
 	/// Diagnostics: the analysis numbers for two pictures.
 	func analyzeNow(_ pb: CVPixelBuffer, previous: CVPixelBuffer?) -> (changed: Float, hist: [Float]) {

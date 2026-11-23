@@ -45,15 +45,21 @@ struct SettingsView: View {
 					Text("30 fps games to 60").tag(1)
 					Text("60 to 120 (experimental)").tag(2)
 				}
-				if settings.frameGeneration != 0 {
-					LabeledContent("Frame generation delay limit") {
+				if settings.frameGeneration == 1 {
+					Picker("Method", selection: settings.$frameGenerationMethod) {
+						Text("Predict ahead (no added lag)").tag(0)
+						Text("In-between (smoothest, delayed)").tag(1)
+					}
+				}
+				if settings.frameGeneration == 2 || (settings.frameGeneration == 1 && settings.frameGenerationMethod == 1) {
+					LabeledContent("Delay limit") {
 						HStack(spacing: 8) {
-							Slider(value: settings.$frameGenerationMaxDelay, in: 20...60, step: 2)
+							Slider(value: settings.$frameGenerationMaxDelay, in: 30...70, step: 5)
 							Text("\(Int(settings.frameGenerationMaxDelay)) ms").monospacedDigit().frame(width: 48, alignment: .trailing)
 						}
 					}
 				}
-				Text("Both apply immediately and switch to the Metal renderer. Frame generation needs about 30 ms of extra delay while it is filling in frames (none when the game already runs at 60); a lower limit is more responsive but shows plain frames more often.")
+				Text("Both apply immediately and switch to the Metal renderer. Predict ahead adds no delay but can wobble briefly when motion changes suddenly. In-between looks smoothest but shows everything about 40 ms later.")
 					.font(.caption)
 					.foregroundStyle(.secondary)
 				Toggle("Low-latency renderer", isOn: settings.$lowLatencyRenderer)

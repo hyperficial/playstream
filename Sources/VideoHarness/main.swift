@@ -59,6 +59,8 @@ struct Options {
 	var seed: UInt64 = 1
 	var switchPacingAt: Double?
 	var makeMediaDir: String?
+	var slipEveryMs = 0.0
+	var fgMethod: VideoFrameGenerationMethod = .extrapolate
 	var qualityRef: String?
 	var upscaler: VideoUpscaler = .off
 	var outputSize: CGSize?
@@ -116,6 +118,9 @@ while !args.isEmpty {
 	case "--seed": opt.seed = UInt64(next()) ?? 1
 	case "--switch-pacing-at": opt.switchPacingAt = Double(next())
 	case "--make-media": opt.makeMediaDir = next()
+	case "--slip-every-ms": opt.slipEveryMs = Double(next()) ?? 0
+	case "--simulate-pacing": _ = next()
+	case "--fg-method": opt.fgMethod = VideoFrameGenerationMethod(rawValue: next()) ?? .extrapolate
 	case "--quality": opt.qualityRef = next()
 	case "--upscaler": opt.upscaler = VideoUpscaler(rawValue: next()) ?? .off
 	case "--frame-gen": opt.frameGen = VideoFrameGeneration(rawValue: next()) ?? .off
@@ -141,6 +146,36 @@ let startTime = CACurrentMediaTime()
 
 if let dir = opt.makeMediaDir {
 	exit(makeMedia(dir: dir) ? 0 : 1)
+}
+
+// Deterministic pacer simulation (no real-time scheduling): --simulate-pacing SECONDS
+if let i = CommandLine.arguments.firstIndex(of: "--simulate-pacing"), i + 1 < CommandLine.arguments.count, let secs = Double(CommandLine.arguments[i + 1]) {
+	let fps = opt.sendFPS ?? Double(opt.fps)
+	let model = ArrivalModel(seed: opt.seed, interval: 1 / fps)
+	let n = Int(secs * fps)
+	let arrivals = (0..<n).map { 100.0 + model.arrival($0) }
+	let refresh = 1.0 / 120
+	for robust in [false, true] {
+		let r = VideoPipeline.simulatePacing(arrivals: arrivals, fps: Int(fps), minDelayMs: opt.minDelayMs ?? 1000.0 / 60, maxDelayMs: opt.maxDelayMs ?? 50, robust: robust)
+		let shown = r.frames.filter { !$0.skip }
+		var hist = [Int](repeating: 0, count: 8)
+		var prevSlot: Int?
+		for f in shown {
+			let slot = Int((f.target / refresh).rounded(.up))
+			if let p = prevSlot { hist[min(7, max(0, slot - p))] += 1 }
+			prevSlot = slot
+		}
+		let total = Double(max(1, hist.reduce(0, +)))
+		let d = r.frames.map { $0.delay * 1000 }.sorted()
+		let lat = zip(r.frames, arrivals).map { ($0.target - $1) * 1000 }.sorted()
+		let expected = Int((1 / fps / refresh).rounded())
+		print(String(format: "%@: playout delay median %.1f p90 %.1f max %.1f ms; arrival->target median %.1f p95 %.1f ms; late %d, skipped %d, re-bases %d; %d-refresh cadence %.1f%% { %@ }",
+		             robust ? "NEW (outliers ignored, slips re-based)" : "OLD (every late frame feeds the estimator)",
+		             d[d.count / 2], d[Int(Double(d.count) * 0.9)], d.last!, lat[lat.count / 2], lat[Int(Double(lat.count) * 0.95)],
+		             r.frames.filter { $0.late }.count, r.frames.filter { $0.skip }.count, r.rebases, expected, Double(hist[expected]) * 100 / total,
+		             (1...7).filter { hist[$0] > 0 }.map { "\($0):\(String(format: "%.1f%%", Double(hist[$0]) * 100 / total))" }.joined(separator: " ")))
+	}
+	exit(0)
 }
 
 // MARK: - Elementary stream splitting (independent of the module's own parser)
@@ -294,6 +329,7 @@ let pipeline = VideoPipeline(displayMode: opt.mode, pacingMode: opt.pacing)
 if let v = opt.minDelayMs { pipeline.minimumPlayoutDelayMs = v }
 if let v = opt.maxDelayMs { pipeline.maximumPlayoutDelayMs = v }
 pipeline.upscaler = opt.upscaler
+pipeline.frameGenerationMethod = opt.fgMethod
 pipeline.frameGeneration = opt.frameGen
 let detectEval = opt.detectTruth.map { DetectEval(truthPath: $0) }
 let interpEval = opt.fgEval ? InterpEval(dumpDir: opt.dumpDir) : nil
@@ -370,6 +406,8 @@ final class ArrivalModel {
 		let ideal = Double(i) * interval
 		var t = ideal + uniform(0, 0.0003)
 		if opt.pattern == "jitter" || opt.pattern == "live" { t += uniform(0, opt.jitterMs / 1000) }
+		// The console misses a frame every slipEveryMs: its timeline moves one interval later for good.
+		if opt.slipEveryMs > 0 { t += (ideal * 1000 / opt.slipEveryMs).rounded(.down) * interval }
 		if let s = stalls.first(where: { ideal >= $0.start && ideal < $0.end }) {
 			t = max(t, s.end) // held by the stalled radio, then delivered in one burst
 		}
@@ -591,7 +629,9 @@ func describePacing(_ s: VideoStats) -> String {
 	t += " upscaler=\(s.upscaler.rawValue)->\(s.activeUpscaler.rawValue) \(s.upscaleInputWidth)x\(s.upscaleInputHeight)->\(s.upscaleOutputWidth)x\(s.upscaleOutputHeight)"
 	if let g = s.renderGPUTimeAvgMs, let m = s.renderGPUTimeMaxMs { t += String(format: " gpu=%.2f/%.2fms", g, m) }
 	if let g = s.scalerGPUTimeAvgMs { t += String(format: " mfx=%.2fms", g) }
+	t += " rebases=\(s.pacerRebases)"
 	if s.frameGeneration != .off {
+		t += " method=\(s.frameGenerationMethod.rawValue) rejMotion=\(s.frameGenerationRejectedMotion)" + String(format: " motion=%.1fms warp=%.1fms", s.frameGenerationMotionMs, s.frameGenerationWarpMs)
 		t += String(format: " fg=%@/%@ content=%.0ffps gen=%.0f/s total=%d fallbacks=%d cuts=%d added=%.1fms interp=%.1fms convert=%.2fms guard=%.2fms shifts=%d lateReal=%d lateGen=%d", s.frameGeneration.rawValue, s.frameGenerationState, s.contentFPS, s.generatedFPS, s.framesGenerated, s.frameGenerationFallbacks, s.frameGenerationCutsSkipped, s.frameGenerationAddedLatencyMs, s.frameGenerationTimeMs, s.frameGenerationConvertMs, s.frameGenerationGuardMs, s.frameGenerationSlotShifts, s.frameGenerationLateReal, s.presentsLateGenerated)
 	}
 	t += String(format: " lead=%.1fms", s.presentationLeadMs)
