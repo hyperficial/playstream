@@ -353,7 +353,14 @@ final class StreamController: ObservableObject {
 		renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
 		renderer.isOpaque = false
 		guard let image = renderer.cgImage else { return }
-		video.setOverlay(image, origin: CGPoint(x: 16, y: 16))
+		// The origin is in the video view's coordinates, and the view is taller than a 16:9
+		// picture on this display, so start below the black bar or the top gets cut off.
+		var origin = CGPoint(x: 16, y: 16)
+		if let view = NSApp.keyWindow?.contentView ?? NSApp.mainWindow?.contentView, view.bounds.width > 0 {
+			let pictureHeight = view.bounds.width * CGFloat(configuration.profile.height) / CGFloat(max(configuration.profile.width, 1))
+			origin.y += max(0, (view.bounds.height - pictureHeight) / 2)
+		}
+		video.setOverlay(image, origin: origin)
 		overlayInFrameShown = true
 	}
 

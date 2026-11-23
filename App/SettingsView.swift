@@ -130,7 +130,7 @@ struct SettingsView: View {
 			}
 		}
 		.formStyle(.grouped)
-		.frame(width: 460)
-		.fixedSize(horizontal: false, vertical: true)
+		// A fixed height keeps the panel on screen; the grouped form scrolls inside it.
+		.frame(width: 460, height: min(640, (NSScreen.main?.visibleFrame.height ?? 800) - 160))
 	}
 }
