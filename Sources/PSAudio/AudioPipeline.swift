@@ -60,6 +60,12 @@ public struct AudioPipelineStats: Sendable {
 	public var totalLatencyMs: Double
 	/// How many times the output has been (re)built, including the first.
 	public var outputBuilds: Int
+	/// The sound shaping in force: "off", or e.g. "night+voices+voiceboost".
+	public var shaping: String
+	/// How far the dynamics stage is holding the level down right now, dB (before its make-up gain).
+	public var dynamicsReductionDb: Double
+	/// Deepest cut the safety limiter made since the stats were last read, dB. Normally 0.
+	public var limiterReductionDb: Double
 }
 
 /// Plays the PS5 audio stream with a low-latency jitter buffer.
@@ -82,6 +88,19 @@ public final class AudioPipeline: AudioStreamSink {
 	public var isMuted: Bool = false {
 		didSet { core.muted.store(isMuted, ordering: .relaxed) }
 	}
+	/// Narrows the loudness range. Main thread, any time; changes fade over a few milliseconds.
+	public var dynamics: AudioDynamics = .off {
+		didSet { core.dynamicsMode.store(dynamics.rawValue, ordering: .relaxed) }
+	}
+	/// Tonal balance. Main thread, any time.
+	public var tone: AudioTone = .flat {
+		didSet { core.toneMode.store(tone.rawValue, ordering: .relaxed) }
+	}
+	/// Lifts the speech band from the centre of the stereo picture, where dialogue sits. Main thread, any time.
+	public var voiceBoost: Bool = false {
+		didSet { core.voiceBoost.store(voiceBoost, ordering: .relaxed) }
+	}
+	// The recording tap gets the stream before any of this: recordings keep the game's own sound.
 	/// Called on the network thread for every incoming chunk, with `mach_absolute_time()` at arrival.
 	/// Set before the stream starts. The tap gets `pcmAudioDidConfigure` on the network thread before its first chunk.
 	public weak var pcmTap: PCMAudioTap?
@@ -181,8 +200,19 @@ public final class AudioPipeline: AudioStreamSink {
 			ioBufferFrames: facts.bufferFrames,
 			outputLatencyMs: outLat,
 			totalLatencyMs: buffered + outLat,
-			outputBuilds: builds
+			outputBuilds: builds,
+			shaping: Self.shapingName(dynamics: core.dynamicsMode.load(ordering: .relaxed), tone: core.toneMode.load(ordering: .relaxed), voice: core.voiceBoost.load(ordering: .relaxed)),
+			dynamicsReductionDb: Double(core.reductionMilliDb.load(ordering: .relaxed)) / 1000,
+			limiterReductionDb: Double(core.limiterMilliDb.exchange(0, ordering: .relaxed)) / 1000
 		)
+	}
+
+	private static func shapingName(dynamics: Int, tone: Int, voice: Bool) -> String {
+		var parts: [String] = []
+		if let mode = AudioDynamics(rawValue: dynamics), mode != .off { parts.append("\(mode)") }
+		if let mode = AudioTone(rawValue: tone), mode != .flat { parts.append("\(mode)") }
+		if voice { parts.append("voiceboost") }
+		return parts.isEmpty ? "off" : parts.joined(separator: "+")
 	}
 
 	// MARK: AudioStreamSink (network thread)

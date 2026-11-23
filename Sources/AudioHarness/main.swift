@@ -9,6 +9,8 @@ import PSContracts
 //   live    (default)  real-time feed through the real output device, quiet (-30 dBFS by default)
 //   offline            virtual-time run against the headless pipeline: thousands of x real time,
 //                      silent, analyses the rendered samples for clicks
+//   effects            measures the sound shaping (dynamics, tone, voice boost, limiter) on the
+//                      headless pipeline; silent (see EffectsTest.swift)
 //
 // Options:
 //   --mode live|offline   --seconds N (default 6 live / 120 offline)   --target MS (35)
@@ -416,5 +418,6 @@ func deviceRate(_ dev: AudioDeviceID) -> Double {
 
 switch mode {
 case "offline": runOffline()
+case "effects": runEffects()
 default: runLive()
 }

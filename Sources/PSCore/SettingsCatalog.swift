@@ -73,6 +73,9 @@ public enum SettingsCatalog {
 		bool("stream.framePacing", true, .live, "Show frames on a steady cadence instead of on arrival."),
 		int("stream.statsLevel", 0, 0...2, names: ["off": 0, "compact": 1, "full": 2], .live, "Stats overlay: 0 off, 1 compact, 2 full."),
 		double("audio.volume", 1, 0...1, .live, "Game audio volume, 0 to 1."),
+		int("audio.dynamics", 0, 0...2, names: ["off": 0, "light": 1, "night": 2], .live, "Loudness range: 0 off, 1 light (a little more even), 2 night (loud held down, quiet lifted, bass trimmed)."),
+		int("audio.tone", 0, 0...3, names: ["flat": 0, "voices": 1, "bright": 2, "warm": 3], .live, "Tone: 0 flat, 1 voices, 2 bright, 3 warm."),
+		bool("audio.voiceBoost", false, .live, "Lift the speech band from the centre of the mix, where dialogue sits."),
 
 		// Controller (live)
 		double("controller.lightBrightness", 0.4, 0...1, .live, "Light bar brightness, 0 to 1."),

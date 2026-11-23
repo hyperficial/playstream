@@ -56,6 +56,12 @@ final class AppSettings: ObservableObject {
 	/// Show frames on a steady cadence (about one frame of delay) instead of the instant they arrive. Applies live.
 	@AppStorage("stream.framePacing") var framePacing: Bool = true
 	@AppStorage("audio.volume") var volume: Double = 1.0
+	/// 0 off, 1 light, 2 night: how much the loudness range is narrowed. Applies live.
+	@AppStorage("audio.dynamics") var audioDynamics: Int = 0
+	/// 0 flat, 1 voices, 2 bright, 3 warm. Applies live.
+	@AppStorage("audio.tone") var audioTone: Int = 0
+	/// Lift the speech band from the centre of the mix. Applies live.
+	@AppStorage("audio.voiceBoost") var voiceBoost: Bool = false
 	@AppStorage("stream.startFullscreen") var startFullscreen: Bool = true
 	/// The local control socket `scripts/psctl` talks to (same user only). Applies live.
 	@AppStorage("debug.controlChannel") var controlChannel: Bool = true

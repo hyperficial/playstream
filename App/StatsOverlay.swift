@@ -205,6 +205,9 @@ struct StatsOverlay: View {
 			}
 			if let audio = stats.audio {
 				row("Audio", String(format: "buffer %.0f/%.0f ms  out %.0f ms  dry %d", audio.bufferedMs, audio.targetMs, audio.outputLatencyMs, audio.underruns))
+				if audio.shaping != "off" {
+					row("Sound", String(format: "%@  holding down %.0f dB", audio.shaping, audio.dynamicsReductionDb))
+				}
 			}
 		}
 	}

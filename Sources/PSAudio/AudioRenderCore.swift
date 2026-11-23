@@ -41,6 +41,8 @@ final class AudioRenderCore {
 
 	let ring: UnsafeMutablePointer<Float>
 	let state: UnsafeMutablePointer<RenderState>
+	/// Tone, voice boost, dynamics and limiter. Touched by the render thread only.
+	let effects: UnsafeMutablePointer<EffectsState>
 
 	let writeIdx = Atomic<Int>(0)
 	let readIdx = Atomic<Int>(0)
@@ -63,6 +65,13 @@ final class AudioRenderCore {
 	let maxExcessMicros = Atomic<Int>(60_000)
 	let volumeBits = Atomic<UInt32>(Float(1).bitPattern)
 	let muted = Atomic<Bool>(false)
+	/// Sound shaping (control side writes, render reads). Raw values of `AudioDynamics` / `AudioTone`.
+	let dynamicsMode = Atomic<Int>(0)
+	let toneMode = Atomic<Int>(0)
+	let voiceBoost = Atomic<Bool>(false)
+	/// For stats: compressor gain reduction and the deepest limiter reduction since the last read, in 1/1000 dB.
+	let reductionMilliDb = Atomic<Int>(0)
+	let limiterMilliDb = Atomic<Int>(0)
 
 	// Stats.
 	let underruns = Atomic<Int>(0)
@@ -78,11 +87,14 @@ final class AudioRenderCore {
 		ring.initialize(repeating: 0, count: Self.capacity * 2)
 		state = UnsafeMutablePointer<RenderState>.allocate(capacity: 1)
 		state.initialize(to: RenderState())
+		effects = UnsafeMutablePointer<EffectsState>.allocate(capacity: 1)
+		effects.initialize(to: EffectsState())
 	}
 
 	deinit {
 		ring.deallocate()
 		state.deallocate()
+		effects.deallocate()
 	}
 
 	// MARK: Control side (only while no render thread is running)
@@ -157,6 +169,11 @@ final class AudioRenderCore {
 		var r = s.pointee.readIdx
 		let fill = w - r
 		let gTarget = currentGainTarget()
+		let fx = effects
+		fx.pointee.prepare(
+			dynamics: dynamicsMode.load(ordering: .relaxed), tone: toneMode.load(ordering: .relaxed),
+			voice: voiceBoost.load(ordering: .relaxed), rate: Int(rate))
+		let shaping = !fx.pointee.bypass
 
 		// Adaptive target: jumps up to what the observed gaps need, decays slowly, never below the floor.
 		let minT = Double(targetMicros.load(ordering: .relaxed)) / 1000.0 * framesPerMs
@@ -291,6 +308,7 @@ final class AudioRenderCore {
 				rr = rr * (1 - wt) + nr * wt
 				xf -= 1
 			}
+			if shaping { fx.pointee.process(&l, &rr) }
 			g += (gTarget - g) * gCoef
 			var gg = g
 			if ramp < rampLen {
@@ -320,6 +338,17 @@ final class AudioRenderCore {
 		s.pointee.lastL = lastL
 		s.pointee.lastR = lastR
 		s.pointee.xfRemaining = xf
+		if shaping {
+			reductionMilliDb.store(Int(fx.pointee.reduction * 1000), ordering: .relaxed)
+			let floor = fx.pointee.limiterFloor
+			if floor < 1 {
+				let deepest = Int(-20 * log10(max(floor, 1e-6)) * 1000)
+				if deepest > limiterMilliDb.load(ordering: .relaxed) { limiterMilliDb.store(deepest, ordering: .relaxed) }
+				fx.pointee.limiterFloor = 1
+			}
+		} else if reductionMilliDb.load(ordering: .relaxed) != 0 {
+			reductionMilliDb.store(0, ordering: .relaxed)
+		}
 		readIdx.store(r, ordering: .releasing)
 	}
 }

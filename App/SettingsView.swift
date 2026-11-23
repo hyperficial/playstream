@@ -6,6 +6,23 @@ struct SettingsView: View {
 	@ObservedObject var settings: AppSettings
 	@ObservedObject var input: ControllerInput
 
+	private var dynamicsCaption: String {
+		switch settings.audioDynamics {
+		case 1: return "A little more even. Quiet detail comes up, peaks come down."
+		case 2: return "For low volume. Explosions and music are held down hard, quiet sound is lifted, deep bass is trimmed."
+		default: return "The game's full range, untouched."
+		}
+	}
+
+	private var toneCaption: String {
+		switch settings.audioTone {
+		case 1: return "Lifts speech and trims the low end beneath it."
+		case 2: return "More air and detail at the top."
+		case 3: return "Fuller low end, softer top."
+		default: return "No change to the tone."
+		}
+	}
+
 	var body: some View {
 		Form {
 			Section("Video") {
@@ -111,6 +128,37 @@ struct SettingsView: View {
 			}
 			Section("Audio") {
 				Slider(value: settings.$volume, in: 0...1) { Text("Volume") }
+				VStack(alignment: .leading, spacing: 6) {
+					Text("Dynamics")
+					Picker("Dynamics", selection: settings.$audioDynamics) {
+						Text("Off").tag(0)
+						Text("Light").tag(1)
+						Text("Night").tag(2)
+					}
+					.pickerStyle(.segmented)
+					.labelsHidden()
+					Text(dynamicsCaption)
+						.font(.caption)
+						.foregroundStyle(.secondary)
+				}
+				VStack(alignment: .leading, spacing: 6) {
+					Text("Tone")
+					Picker("Tone", selection: settings.$audioTone) {
+						Text("Flat").tag(0)
+						Text("Voices").tag(1)
+						Text("Bright").tag(2)
+						Text("Warm").tag(3)
+					}
+					.pickerStyle(.segmented)
+					.labelsHidden()
+					Text(toneCaption)
+						.font(.caption)
+						.foregroundStyle(.secondary)
+				}
+				Toggle("Voice boost", isOn: settings.$voiceBoost)
+				Text("Lifts speech-range sound from the centre of the mix, where dialogue sits. Made for Night, works with any setting. All three apply immediately and are not part of recordings.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
 			}
 			Section("Developer") {
 				Toggle("Reconnect at launch", isOn: settings.$autoReconnect)

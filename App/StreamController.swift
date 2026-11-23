@@ -84,6 +84,9 @@ final class StreamController: ObservableObject {
 
 	func start() throws {
 		audio.volume = Float(settings.volume)
+		audio.dynamics = AudioDynamics(rawValue: settings.audioDynamics) ?? .off
+		audio.tone = AudioTone(rawValue: settings.audioTone) ?? .flat
+		audio.voiceBoost = settings.voiceBoost
 
 		video.keyframeRequester = session
 		video.encodedTap = recorder
@@ -200,6 +203,16 @@ final class StreamController: ObservableObject {
 		if abs(audio.volume - wantedVolume) > 0.001 {
 			audio.volume = wantedVolume
 			changes.append(String(format: "volume %.2f", wantedVolume))
+		}
+		let dynamics = AudioDynamics(rawValue: settings.audioDynamics) ?? .off
+		let tone = AudioTone(rawValue: settings.audioTone) ?? .flat
+		if audio.dynamics != dynamics || audio.tone != tone || audio.voiceBoost != settings.voiceBoost {
+			audio.dynamics = dynamics
+			audio.tone = tone
+			audio.voiceBoost = settings.voiceBoost
+			let line = "dynamics \(dynamics), tone \(tone), voice boost \(settings.voiceBoost ? "on" : "off")"
+			CoreLog.note("Audio settings changed: " + line)
+			changes.append(line)
 		}
 		changes += applyDebugSettings()
 		return changes
