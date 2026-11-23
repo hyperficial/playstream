@@ -143,6 +143,11 @@ public struct VideoStats: Sendable, Equatable {
 	public var frameGenerationCutsSkipped: Int = 0
 	/// Extra hold applied while generating (wait for the next picture + processing), ms. 0 when native.
 	public var frameGenerationAddedLatencyMs: Double = 0
+	/// Outcome of every generation slot since the stream started, by reason (TraceReason names:
+	/// "generated", "deadline_missed", "cut", "loss", "low_confidence", "motion_changing",
+	/// "no_motion_history", "static_content", "budget_exceeded", "interpolator_not_ready",
+	/// "interpolation_failed", "run_of_repeats", "no_gap_slot", "processing_too_late", "no_previous", "cancelled").
+	public var frameGenerationReasons: [String: Int] = [:]
 	/// Last interpolation call (VideoToolbox low-latency frame interpolation), ms.
 	public var frameGenerationTimeMs: Double = 0
 	/// Last 10 -> 8-bit conversion (HDR only) and static-overlay guard, ms (both on the critical path).

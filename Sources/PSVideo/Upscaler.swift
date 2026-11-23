@@ -46,6 +46,8 @@ final class FrameScaler {
 	private var pipelines: [String: MTLRenderPipelineState] = [:]
 	let metalFXSupported: Bool
 	var hdrDomain: MetalFXHDRDomain = .linear
+	/// When set, sharpness and the MetalFX HDR domain follow the live tunables.
+	var tunables: Tunables?
 	/// Sharpening for scalers with a sharpening stage (FSR 1 RCAS), 0...1. 0 = no sharpening pass.
 	var sharpness: Float = 0.5
 	private let fsrLibrary: MTLLibrary
@@ -119,6 +121,7 @@ final class FrameScaler {
 			return ([cmd], nil)
 
 		case .fsr1:
+			if let t = tunables?.values { sharpness = Float(t.scalerSharpness) }
 			// FSR 1 works on perceptually encoded 0...1 signals (AMD: "after tonemapping"); RCAS's clip
 			// limiter assumes a peak of 1.0. PQ R'G'B' is such a signal, so HDR runs in the PQ domain and
 			// highlights stay where PQ puts them (no tone mapping, nothing clipped below PQ 1.0).
@@ -153,6 +156,10 @@ final class FrameScaler {
 			return ([convert, scale], scale)
 
 		case .metalFXSpatial:
+			if let t = tunables?.values {
+				let d: MetalFXHDRDomain = t.scalerMetalFXHDRLinear >= 0.5 ? .linear : .pq
+				if d != hdrDomain { hdrDomain = d; releaseScaler() }
+			}
 			let linear = hdr && hdrDomain == .linear
 			let key = ScalerKey(inW: y.width, inH: y.height, outW: target.width, outH: target.height,
 			                    mode: linear ? .hdr : .perceptual)

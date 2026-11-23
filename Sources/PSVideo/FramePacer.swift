@@ -18,6 +18,10 @@ struct FrameSchedule {
 	var jitter = 0.0
 	/// Delay the pacer applies (target - grid), s.
 	var pacerDelay = 0.0
+	/// Late by a whole interval (missed console frame / stall).
+	var outlier = false
+	/// Trace record of this frame.
+	var traceID = 0
 	static let immediate = FrameSchedule(target: nil, skip: false)
 }
 
@@ -42,15 +46,22 @@ func hostSeconds(_ ticks: UInt64) -> Double {
 /// - If `delay` exceeds `targetDelay` by more than `skipFrames` intervals (badly behind after a long
 ///   stall), frames are skipped (decoded, not shown) until it doesn't. Latency cannot creep up.
 final class FramePacer {
-	// Tunables.
-	var minDelay = 1.0 / 60
-	var maxDelay = 0.050
-	let percentile = 0.99
-	let margin = 0.002
-	let decayPerSecond = 0.010
-	let catchUp = 0.10
-	let fastCatchUp = 0.50
-	let skipFrames = 3.0
+	// Tunables (snapshot taken once per frame; see Tunables.specs for meanings and ranges).
+	let tunables: Tunables
+	private var t = TunableValues()
+	var minDelay: Double { t.pacerMinDelayMs / 1000 }
+	var maxDelay: Double { t.pacerMaxDelayMs / 1000 }
+	var percentile: Double { t.pacerPercentile }
+	var margin: Double { t.pacerMarginMs / 1000 }
+	var decayPerSecond: Double { t.pacerDecayMsPerSecond / 1000 }
+	var catchUp: Double { t.pacerCatchUp }
+	var fastCatchUp: Double { t.pacerFastCatchUp }
+	var skipFrames: Double { t.pacerSkipFrames }
+
+	init(tunables: Tunables = Tunables()) {
+		self.tunables = tunables
+		t = tunables.values
+	}
 
 	private(set) var interval = 1.0 / 60
 	private var nominalFPS = 60.0
@@ -72,13 +83,13 @@ final class FramePacer {
 	private(set) var targetDelay = 1.0 / 60
 
 	// 2 s window of relative arrivals (o = arrival - k*T) and lateness.
-	private var offsets = Ring(capacity: 256)
-	private var lateness = Ring(capacity: 256)
-	private var scratch = [Double](repeating: 0, count: 512)
+	private var offsets = Ring(capacity: 1024)
+	private var lateness = Ring(capacity: 1024)
+	private var scratch = [Double](repeating: 0, count: 2048)
 
 	// 5 s window of inter-arrival jitter and gaps, for stats.
-	private var jitter = Ring(capacity: 512)
-	private var gaps = Ring(capacity: 512)
+	private var jitter = Ring(capacity: 2048)
+	private var gaps = Ring(capacity: 2048)
 
 	// Frame-rate detection.
 	private var rateMismatchFrames = 0
@@ -104,10 +115,11 @@ final class FramePacer {
 	}
 
 	/// Window sizes in frames for the current frame rate.
-	private var analysisFrames: Int { min(offsets.capacity, max(8, Int((2.0 / interval).rounded()))) }
-	private var statsFrames: Int { min(jitter.capacity, max(8, Int((5.0 / interval).rounded()))) }
+	private var analysisFrames: Int { min(offsets.capacity, max(8, Int((t.pacerWindowSeconds / interval).rounded()))) }
+	private var statsFrames: Int { min(jitter.capacity, max(8, Int((t.pacerStatsWindowSeconds / interval).rounded()))) }
 
 	func schedule(arrival a: Double, framesLost: Int) -> FrameSchedule {
+		t = tunables.values
 		let lost = max(0, framesLost)
 		if !started {
 			started = true
@@ -141,10 +153,10 @@ final class FramePacer {
 		// maximum delay can cover a couple of frames of jitter, so only lateness the buffer could never
 		// absorb counts as an outlier there.
 		let lowRate = interval > 1.0 / 45
-		let outlier = robustOutliers && late >= 0.75 * interval && (lowRate || late >= 0.75 * maxDelay)
+		let outlier = robustOutliers && late >= t.pacerOutlierFraction * interval && (lowRate || late >= t.pacerOutlierMaxDelayFraction * maxDelay)
 		if outlier {
 			slipRun.append(late)
-			if slipRun.count >= 2, let lo = slipRun.min(), let hi = slipRun.max(), hi - lo < 0.25 * interval {
+			if slipRun.count >= Int(t.pacerRebaseCount), let lo = slipRun.min(), let hi = slipRun.max(), hi - lo < t.pacerRebaseSpreadFraction * interval {
 				// Two frames in a row late by the same amount: the console's timeline moved. Re-base the grid
 				// on the new timeline at once (instead of after the 2 s window).
 				offsets.removeAll()
@@ -159,7 +171,7 @@ final class FramePacer {
 		}
 		// Stream start (decoder creation, first IDR) delays the first frames once; don't let that
 		// one-off set the playout delay for the next seconds. Late frames still re-anchor below.
-		if !outlier { lateness.push(a - startArrival < 0.5 ? 0 : late, limit: analysisFrames) }
+		if !outlier { lateness.push(a - startArrival < t.pacerWarmupSeconds ? 0 : late, limit: analysisFrames) }
 
 		// Target delay from the lateness distribution.
 		let p = lateness.percentile(percentile, scratch: &scratch) + margin
@@ -179,10 +191,10 @@ final class FramePacer {
 			// that would land on an already-shown picture are skipped below. No latency is added afterwards.
 			isLate = true
 			let target = a + delay
-			let skip = target < lastTarget + 0.25 * interval
+			let skip = target < lastTarget + t.pacerBurstSkipFraction * interval
 			if !skip { lastTarget = target }
 			return FrameSchedule(target: target, skip: skip, late: true, interval: interval, grid: base + Double(k) * interval,
-			                     jitter: min(lateness.percentile(percentile, scratch: &scratch) + margin, maxDelay), pacerDelay: delay)
+			                     jitter: min(lateness.percentile(percentile, scratch: &scratch) + margin, maxDelay), pacerDelay: delay, outlier: true)
 		} else if late > delay + 0.0005 {
 			isLate = true
 			delay = late // shown at once; the grid re-anchors on this frame
@@ -205,7 +217,7 @@ final class FramePacer {
 		let grid = base + Double(k) * interval
 		var target = max(a, grid + delay)
 		// Never land on (or before) the picture just shown: such a frame is part of a burst after a stall.
-		if target < lastTarget + 0.25 * interval {
+		if target < lastTarget + t.pacerBurstSkipFraction * interval {
 			skip = true
 		} else {
 			lastTarget = target
@@ -231,15 +243,15 @@ final class FramePacer {
 		var snapped = 1 / estimated
 		for div in [1.0, 2.0, 3.0, 4.0] {
 			let cand = nominalFPS / div
-			if abs(snapped - cand) / cand < 0.12 { snapped = cand; break }
+			if abs(snapped - cand) / cand < t.pacerRateTolerance { snapped = cand; break }
 		}
 		let current = 1 / interval
-		if abs(snapped - current) / current < 0.12 {
+		if abs(snapped - current) / current < t.pacerRateTolerance {
 			rateMismatchFrames = 0
 			return false
 		}
 		rateMismatchFrames += 1
-		guard rateMismatchFrames >= 10 else { return false }
+		guard rateMismatchFrames >= Int(t.pacerRateMismatchFrames) else { return false }
 		rateMismatchFrames = 0
 		interval = 1 / snapped
 		NSLog("[PSVideo] stream frame rate now %.1f fps (pacing grid follows)", snapped)

@@ -5,7 +5,7 @@ import PSContracts
 
 /// Path (a): compressed samples into `AVSampleBufferDisplayLayer.sampleBufferRenderer`, no control
 /// timebase, every sample tagged DisplayImmediately, so each frame is shown as soon as it is decoded.
-final class SampleBufferLayerRenderer: VideoRenderer {
+final class SampleBufferLayerRenderer: VideoRenderer, @unchecked Sendable {
 	let mode = VideoDisplayMode.sampleBufferLayer
 	let displayLayer: AVSampleBufferDisplayLayer
 	private let renderer: AVSampleBufferVideoRenderer
@@ -41,6 +41,33 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 	private var lead = 0.004
 	private var lastLeadChange = 0.0
 	var presentedObserver: ((Double, Double) -> Void)?
+	var tunables = Tunables()
+	var trace: FrameTrace?
+	let capture = PresentedFrameCapture()
+	private var captureTimer: Timer?
+	private var lastCaptured: ObjectIdentifier?
+
+	/// Layer path: the layer composites internally; the closest available picture is the displayed pixel
+	/// buffer (decoded, before the layer's own scaling). Polled at 120 Hz on the main thread.
+	func startCapture(count: Int, directory: URL, hdr: Bool, completion: @escaping @Sendable ([URL]) -> Void) {
+		capture.start(count: count, directory: directory) { [weak self] urls in
+			onMain { self?.captureTimer?.invalidate(); self?.captureTimer = nil }
+			completion(urls)
+		}
+		onMain { [weak self] in
+			guard let self else { return }
+			let t = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
+				guard let self, let pb = self.renderer.displayedPixelBuffer() else { return }
+				let id = ObjectIdentifier(pb)
+				if id != self.lastCaptured {
+					self.lastCaptured = id
+					self.capture.captureBuffer(pb, kind: "real", hdr: hdr)
+				}
+			}
+			RunLoop.main.add(t, forMode: .common)
+			self.captureTimer = t
+		}
+	}
 
 	var layer: CALayer { displayLayer }
 	var needsKeyframe: Bool { lock.withLock { flags.needsKeyframe } }
@@ -177,6 +204,14 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 		var s = schedule
 		if let t = s.target { s.target = t + lead }
 		renderer.enqueue(displaySample(sample, schedule: s, paced: paced))
+		if let tr = trace, schedule.traceID > 0 {
+			let at = paced ? s.target : nil
+			tr.update(schedule.traceID) { r in
+				r.committed = CACurrentMediaTime()
+				if let at { r.presentAt = at }
+				r.shown = schedule.skip ? .skipped : .real
+			}
+		}
 		stats.handedOff(ms: StatsCollector.ms(from: arrival, to: mach_absolute_time()))
 		if isKeyframe { lock.withLock { flags.needsKeyframe = false } }
 
@@ -209,7 +244,7 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 		lock.withLock {
 			guard paced else { return }
 			if frameDelay > 0.001 {
-				lead = min(0.0167, lead + frameDelay) // bounded: at most one 60 Hz frame
+				lead = min(tunables.values.layerLeadCapMs / 1000, lead + frameDelay) // bounded
 				lastLeadChange = now
 			} else if now - lastLeadChange > 3 {
 				lead = max(0.002, lead - 0.0005)

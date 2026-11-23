@@ -50,6 +50,10 @@ protocol VideoRenderer: AnyObject {
 	func setUpscaler(_ upscaler: VideoUpscaler)
 	/// Pixel size of the aspect-fit video rect on screen (main thread).
 	func setOutputPixelSize(_ size: CGSize)
+	/// Live-adjustable internals shared with the pipeline (set right after creation).
+	var tunables: Tunables { get set }
+	/// Per-frame trace shared with the pipeline.
+	var trace: FrameTrace? { get set }
 	/// Diagnostics: each frame that reached the glass (host seconds), with its arrival time. Metal paced path only.
 	var presentedObserver: ((_ presentedTime: Double, _ arrival: Double) -> Void)? { get set }
 	/// Stream ended or restarting: drop decoder state and the shown image.

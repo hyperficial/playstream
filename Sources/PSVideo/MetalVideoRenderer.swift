@@ -21,7 +21,7 @@ import VideoToolbox
 /// HDR: 10-bit biplanar output ('x420'), converted with the BT.2020 NCL matrix into PQ-encoded RGB on
 /// an `rgba16Float` drawable tagged ITU-R 2100 PQ with HDR10 EDR metadata, so the system maps it onto
 /// the display's EDR headroom (or tone maps it on an SDR display). SDR: 8-bit, BT.709, sRGB-ish layer.
-final class MetalVideoRenderer: VideoRenderer {
+final class MetalVideoRenderer: VideoRenderer, @unchecked Sendable {
 	let mode = VideoDisplayMode.metal
 	let metalLayer = CAMetalLayer()
 	var layer: CALayer { metalLayer }
@@ -51,7 +51,9 @@ final class MetalVideoRenderer: VideoRenderer {
 		var needsKeyframe = true
 		var decodeFailed = false
 		var consecutiveErrors = 0
-		var pending: (buffer: CVPixelBuffer, arrival: UInt64)?
+		var pending: (buffer: CVPixelBuffer, arrival: UInt64, trace: Int)?
+		/// Last picture that reached the glass (trace id, presented time), for its on-screen duration.
+		var lastShown: (id: Int, t: Double)?
 		var renderScheduled = false
 		var lastFrame: CVPixelBuffer?
 		var config = RenderConfig()
@@ -93,6 +95,8 @@ final class MetalVideoRenderer: VideoRenderer {
 		var refresh: Double
 		var config: RenderConfig
 		var generated = false
+		var traceID = 0
+		var shown = TraceRecord.Shown.real
 	}
 
 	struct Scheduled {
@@ -104,12 +108,41 @@ final class MetalVideoRenderer: VideoRenderer {
 		var grid = 0.0
 		var jitter = 0.0
 		var pacerDelay = 0.0
+		var traceID = 0
 	}
 
 
 	private let lock = UnfairLock()
 	private var shared = Shared()
 	var presentedObserver: ((Double, Double) -> Void)?
+	var trace: FrameTrace? {
+		didSet { generator?.trace = trace }
+	}
+	let capture = PresentedFrameCapture()
+
+	/// Starts a capture of the next `count` presented pictures (drawables are made readable meanwhile).
+	func startCapture(count: Int, directory: URL, completion: @escaping @Sendable ([URL]) -> Void) {
+		renderQueue.async { [weak self] in
+			guard let self else { return }
+			CATransaction.begin(); CATransaction.setDisableActions(true)
+			self.metalLayer.framebufferOnly = false
+			CATransaction.commit()
+			self.capture.start(count: count, directory: directory) { [weak self] urls in
+				self?.renderQueue.async {
+					CATransaction.begin(); CATransaction.setDisableActions(true)
+					self?.metalLayer.framebufferOnly = true
+					CATransaction.commit()
+				}
+				completion(urls)
+			}
+		}
+	}
+	var tunables = Tunables() {
+		didSet {
+			scaler.tunables = tunables
+			generator?.tunables = tunables
+		}
+	}
 
 	private let debugPacing = ProcessInfo.processInfo.environment["PSVIDEO_DEBUG_PACING"] != nil
 
@@ -161,7 +194,7 @@ final class MetalVideoRenderer: VideoRenderer {
 			shared.lastPresentedTime = 0
 			return shared.refresh
 		}
-		stats.update { $0.presentationLeadMs = on ? Self.presentLead(refresh) * 1000 : 0 }
+		stats.update { $0.presentationLeadMs = on ? self.presentLead(refresh) * 1000 : 0 }
 	}
 
 	// MARK: Frame generation
@@ -186,19 +219,18 @@ final class MetalVideoRenderer: VideoRenderer {
 	private var frameGenerationMethod: VideoFrameGenerationMethod = .extrapolate
 
 	func setMaxAddedLatency(_ seconds: Double) {
-		maxAddedLatency = seconds
-		generator?.maxAddedLatency = seconds
+		tunables.set("fg.maxAddedLatencyMs", min(300, max(0, seconds * 1000)))
 	}
-	private var maxAddedLatency = 0.045
 
 	private func makeGenerator() -> FrameGenerator? {
 		let g = FrameGenerator(device: device, stats: stats)
+		g?.trace = trace
 		g?.emit = { [weak self] e in self?.enqueue(e) }
 		g?.vsync = { [weak self] in
 			guard let self else { return nil }
 			return self.lock.withLock { self.shared.vsyncPeriod > 0 ? (self.shared.vsyncPhase, self.shared.vsyncPeriod) : nil }
 		}
-		g?.maxAddedLatency = maxAddedLatency
+		g?.tunables = tunables
 		g?.setMethod(frameGenerationMethod)
 		return g
 	}
@@ -216,8 +248,9 @@ final class MetalVideoRenderer: VideoRenderer {
 	/// A picture from the generator (real, generated or fallback) -> display queue.
 	private func enqueue(_ e: GeneratedEmit) {
 		let (refresh, config) = lock.withLock { (shared.refresh, shared.config) }
-		appendPaced(PacedFrame(buffer: e.buffer, arrival: e.arrival, at: e.presentAt ?? (e.target + Self.presentLead(refresh)), interval: e.interval,
-		                       refresh: refresh, config: config, generated: e.kind == .generated))
+		appendPaced(PacedFrame(buffer: e.buffer, arrival: e.arrival, at: e.presentAt ?? (e.target + presentLead(refresh)), interval: e.interval,
+		                       refresh: refresh, config: config, generated: e.kind == .generated, traceID: e.traceID,
+		                       shown: e.kind == .generated ? .generated : (e.kind == .fallbackRepeat ? .fallbackRepeat : .real)))
 		displayObserver?(e.kind, e.target, e.sourceIndex)
 	}
 
@@ -227,20 +260,23 @@ final class MetalVideoRenderer: VideoRenderer {
 	/// `present(atTime:)` shows it at the first vsync at or after that, so on average half a refresh
 	/// later. No feedback loop. (Was +half a refresh: that only added latency, the commit slack was
 	/// already ample: target - commit >= playout delay - decode - render ~ 11 ms.)
-	static func presentLead(_ refresh: Double) -> Double { 0 }
+	func presentLead(_ refresh: Double) -> Double { tunables.values.renderPresentLeadRefreshes * refresh }
 
 	/// How long before its requested time a paced frame is rendered and committed: two refreshes + 4 ms
 	/// (~20.7 ms at 120 Hz) so the compositor always has more than it needs, while keeping only ~2
 	/// drawables in flight. A frame decoded later than that is rendered immediately.
-	static func renderAhead(_ refresh: Double) -> Double { 2 * refresh + 0.004 }
+	func renderAhead(_ refresh: Double) -> Double {
+		let t = tunables.values
+		return t.renderAheadRefreshes * refresh + t.renderAheadExtraMs / 1000
+	}
 
-	static let maxPacedQueue = 16
 
 	private func appendPaced(_ f: PacedFrame) {
+		let cap = Int(tunables.values.renderQueueCapacity)
 		let (overflow, depth): (Bool, Int) = lock.withLock {
 			let i = shared.pacedQueue.firstIndex { $0.at > f.at } ?? shared.pacedQueue.count
 			shared.pacedQueue.insert(f, at: i)
-			if shared.pacedQueue.count > Self.maxPacedQueue {
+			if shared.pacedQueue.count > cap {
 				shared.pacedQueue.removeFirst()
 				return (true, shared.pacedQueue.count)
 			}
@@ -260,11 +296,12 @@ final class MetalVideoRenderer: VideoRenderer {
 
 	/// Render queue: render every paced frame that is due, then sleep until the next one is.
 	private func servicePacedQueue() {
+		let ahead: (Double) -> Double = { [unowned self] r in self.renderAhead(r) }
 		while true {
 			let now = CACurrentMediaTime()
 			let (due, wakeAt): (PacedFrame?, Double?) = lock.withLock {
 				guard let f = shared.pacedQueue.first else { return (nil, nil) }
-				let start = f.at - Self.renderAhead(f.refresh)
+				let start = f.at - ahead(f.refresh)
 				if start <= now + 0.0005 {
 					shared.pacedQueue.removeFirst()
 					return (f, nil)
@@ -283,7 +320,8 @@ final class MetalVideoRenderer: VideoRenderer {
 				}
 				let depth = lock.withLock { shared.pacedQueue.count }
 				stats.pacedCommit(aheadMs: (f.at - CACurrentMediaTime()) * 1000, queueDepth: depth, drawableWaitMs: waited)
-				render(f.buffer, arrival: f.arrival, config: f.config, plan: plan, drawable: drawable, interval: f.interval, refresh: f.refresh, presentAt: f.at, generated: f.generated)
+				render(f.buffer, arrival: f.arrival, config: f.config, plan: plan, drawable: drawable, interval: f.interval, refresh: f.refresh, presentAt: f.at, generated: f.generated,
+				       traceID: f.traceID, shown: f.shown)
 				continue
 			}
 			if let w = wakeAt {
@@ -319,8 +357,7 @@ final class MetalVideoRenderer: VideoRenderer {
 	// MARK: Upscaling
 
 	func setSharpness(_ v: Double) {
-		let s = Float(min(1, max(0, v)))
-		renderQueue.async { [weak self] in self?.scaler.sharpness = s }
+		tunables.set("scaler.sharpness", min(1, max(0, v)))
 	}
 
 	func setUpscaler(_ u: VideoUpscaler) {
@@ -429,7 +466,7 @@ final class MetalVideoRenderer: VideoRenderer {
 			let pts = CMSampleBufferGetPresentationTimeStamp(sample)
 			let key = pts.isValid ? CMClockConvertHostTimeToSystemUnits(pts) : arrival
 			lock.withLock {
-				shared.schedules.append(Scheduled(arrival: key, target: schedule.target, skip: schedule.skip, interval: schedule.interval, discontinuity: schedule.discontinuity, grid: schedule.grid, jitter: schedule.jitter, pacerDelay: schedule.pacerDelay))
+				shared.schedules.append(Scheduled(arrival: key, target: schedule.target, skip: schedule.skip, interval: schedule.interval, discontinuity: schedule.discontinuity, grid: schedule.grid, jitter: schedule.jitter, pacerDelay: schedule.pacerDelay, traceID: schedule.traceID))
 				if shared.schedules.count > 32 { shared.schedules.removeFirst(shared.schedules.count - 32) }
 			}
 			var info = VTDecodeInfoFlags()
@@ -574,6 +611,7 @@ final class MetalVideoRenderer: VideoRenderer {
 			return
 		}
 		stats.frameDecoded(decodeMs: StatsCollector.ms(from: submitted, to: now))
+		if let tr = trace, let id = sched?.traceID { tr.update(id) { $0.decoded = hostSeconds(now) } }
 		let arrival = pts.isValid ? CMClockConvertHostTimeToSystemUnits(pts) : submitted
 		decodedFrameObserver?(image)
 		// Frame generation (paced only): the generator decides what is shown when.
@@ -585,7 +623,7 @@ final class MetalVideoRenderer: VideoRenderer {
 				let disc = sc.discontinuity || shared.errorSinceLastFrame
 				shared.errorSinceLastFrame = false
 				return FrameGenerator.Input(buffer: image, arrival: arrival, target: target, interval: sc.interval, skip: sc.skip, discontinuity: disc,
-				                            grid: sc.grid, jitter: sc.jitter, pacerDelay: sc.pacerDelay)
+				                            grid: sc.grid, jitter: sc.jitter, pacerDelay: sc.pacerDelay, traceID: sc.traceID)
 			}
 			if let input {
 				gen.submit(input)
@@ -593,21 +631,23 @@ final class MetalVideoRenderer: VideoRenderer {
 			}
 		}
 		// Paced: render now, ask the compositor to put it on glass at its target time.
+		let leadRefreshes = tunables.values.renderPresentLeadRefreshes
 		let paced: (target: Double, interval: Double, skip: Bool, config: RenderConfig, refresh: Double)? = lock.withLock {
 			guard shared.paced, let sc = sched, let target = sc.target else { return nil }
+			let lead = leadRefreshes * shared.refresh
 			shared.lastFrame = image
 			shared.consecutiveErrors = 0
-			return (target + Self.presentLead(shared.refresh), sc.interval, sc.skip, shared.config, shared.refresh)
+			return (target + lead, sc.interval, sc.skip, shared.config, shared.refresh)
 		}
 		if let p = paced {
 			if p.skip { return } // catching up: decoded as a reference, not shown
-			appendPaced(PacedFrame(buffer: image, arrival: arrival, at: p.target, interval: p.interval, refresh: p.refresh, config: p.config))
+			appendPaced(PacedFrame(buffer: image, arrival: arrival, at: p.target, interval: p.interval, refresh: p.refresh, config: p.config, traceID: sched?.traceID ?? 0))
 			return
 		}
 
 		let (schedule, superseded): (Bool, Bool) = lock.withLock {
 			let sup = shared.pending != nil
-			shared.pending = (image, arrival)
+			shared.pending = (image, arrival, sched?.traceID ?? 0)
 			shared.lastFrame = image
 			shared.consecutiveErrors = 0
 			let sch = !shared.renderScheduled
@@ -623,7 +663,7 @@ final class MetalVideoRenderer: VideoRenderer {
 	// MARK: Rendering (render queue)
 
 	private func renderPending() {
-		let (item, config): ((buffer: CVPixelBuffer, arrival: UInt64)?, RenderConfig) = lock.withLock {
+		let (item, config): ((buffer: CVPixelBuffer, arrival: UInt64, trace: Int)?, RenderConfig) = lock.withLock {
 			let p = shared.pending
 			shared.pending = nil
 			shared.renderScheduled = false
@@ -639,7 +679,7 @@ final class MetalVideoRenderer: VideoRenderer {
 			stats.drop(.noDrawable)
 			return
 		}
-		render(item.buffer, arrival: item.arrival, config: config, plan: plan, drawable: drawable, interval: nil, refresh: nil, presentAt: nil)
+		render(item.buffer, arrival: item.arrival, config: config, plan: plan, drawable: drawable, interval: nil, refresh: nil, presentAt: nil, traceID: item.trace)
 	}
 
 	private func applyConfigIfNeeded(_ config: RenderConfig, sample: CVPixelBuffer) {
@@ -679,7 +719,8 @@ final class MetalVideoRenderer: VideoRenderer {
 
 	/// Draws `pb` into `drawable` and presents it. `interval`/`refresh` are set on the paced path for
 	/// cadence statistics.
-	private func render(_ pb: CVPixelBuffer, arrival: UInt64, config: RenderConfig, plan: Plan, drawable: CAMetalDrawable, interval: Double?, refresh: Double?, presentAt: Double?, generated: Bool = false) {
+	private func render(_ pb: CVPixelBuffer, arrival: UInt64, config: RenderConfig, plan: Plan, drawable: CAMetalDrawable, interval: Double?, refresh: Double?, presentAt: Double?, generated: Bool = false,
+	                    traceID: Int = 0, shown: TraceRecord.Shown = .real) {
 		guard let (yTex, cTex, uniforms) = makeTextures(pb, matrix: config.matrix),
 		      let y = CVMetalTextureGetTexture(yTex), let c = CVMetalTextureGetTexture(cTex),
 		      let encoded = scaler.encode(queue: commandQueue, y: y, c: c, uniforms: uniforms, mode: plan.mode, hdr: config.hdr, target: drawable.texture),
@@ -698,14 +739,30 @@ final class MetalVideoRenderer: VideoRenderer {
 			stats.renderGPU(ms: (b.gpuEndTime - first.gpuStartTime) * 1000)
 		}
 
+		if capture.active {
+			let kind = shown == .generated ? "generated" : (shown == .fallbackRepeat ? "fallback_repeat" : "real")
+			capture.encodeCopy(device: device, cmd: cmd, texture: drawable.texture, kind: kind, traceID: traceID,
+			                   presentAt: presentAt, colorSpace: metalLayer.colorspace)
+		}
 		let arrivalSeconds = hostSeconds(arrival)
 		drawable.addPresentedHandler { [weak self] d in
 			let t = d.presentedTime
 			guard t > 0 else {
 				stats.presentNotShown()
+				if traceID > 0 { self?.trace?.update(traceID) { $0.shown = .notShown } }
 				return
 			}
 			stats.presented(at: t)
+			if let self, let tr = self.trace {
+				let r = refresh ?? (1.0 / 120)
+				let prev: (id: Int, t: Double)? = self.lock.withLock {
+					let p = self.shared.lastShown
+					self.shared.lastShown = (traceID, t)
+					return p
+				}
+				if let p = prev, p.id > 0 { tr.update(p.id) { $0.refreshes = ((t - p.t) / r).rounded() } }
+				if traceID > 0 { tr.update(traceID) { $0.presented = t } }
+			}
 			// Arrival-to-glass is about real pictures (a generated one carries the next picture's arrival).
 			if !generated { stats.onGlass(ms: (t - arrivalSeconds) * 1000) }
 			guard let self else { return }
@@ -741,6 +798,14 @@ final class MetalVideoRenderer: VideoRenderer {
 			_ = cTex
 		}
 		for b in encoded.buffers { b.commit() }
+		if traceID > 0, let tr = trace {
+			let now = CACurrentMediaTime()
+			tr.update(traceID) { r in
+				r.committed = now
+				if let at = presentAt { r.presentAt = at }
+				if r.kind == .frame { r.shown = shown }
+			}
+		}
 		stats.handedOff(ms: StatsCollector.ms(from: arrival, to: mach_absolute_time()))
 	}
 

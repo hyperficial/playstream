@@ -60,6 +60,13 @@ struct Options {
 	var switchPacingAt: Double?
 	var makeMediaDir: String?
 	var slipEveryMs = 0.0
+	var captureFile: String?
+	var bunch = 0.0
+	var steady = false
+	var makeCapture: String?
+	var traceOut: String?
+	var captureFramesDir: String?
+	var tunableSets: [(String, Double)] = []
 	var fgMethod: VideoFrameGenerationMethod = .extrapolate
 	var qualityRef: String?
 	var upscaler: VideoUpscaler = .off
@@ -120,6 +127,15 @@ while !args.isEmpty {
 	case "--switch-pacing-at": opt.switchPacingAt = Double(next())
 	case "--make-media": opt.makeMediaDir = next()
 	case "--slip-every-ms": opt.slipEveryMs = Double(next()) ?? 0
+	case "--capture": opt.captureFile = next()
+	case "--steady": opt.steady = true
+	case "--bunch": opt.bunch = Double(next()) ?? 0
+	case "--make-capture": opt.makeCapture = next()
+	case "--trace": opt.traceOut = next()
+	case "--capture-frames": opt.captureFramesDir = next()
+	case "--set":
+		let kv = next().split(separator: "=")
+		if kv.count == 2, let v = Double(kv[1]) { opt.tunableSets.append((String(kv[0]), v)) }
 	case "--simulate-pacing": _ = next()
 	case "--fg-method": opt.fgMethod = VideoFrameGenerationMethod(rawValue: next()) ?? .extrapolate
 	case "--quality": opt.qualityRef = next()
@@ -302,7 +318,7 @@ final class TapCounter: EncodedVideoTap {
 // MARK: - Load
 
 let hevc = opt.codec.isHEVC
-guard let fileData = FileManager.default.contents(atPath: opt.file) else {
+guard let fileData = opt.captureFile != nil ? Data([0, 0, 0, 1, 0x40, 0x01]) : FileManager.default.contents(atPath: opt.file) else {
 	print("cannot read \(opt.file); run build/video-test/gen.sh first")
 	exit(1)
 }
@@ -315,6 +331,39 @@ if let t = opt.thenFile {
 	log("then: \(t): header \(second!.header.count) B, \(second!.frames.count) frames")
 }
 log("loaded \(opt.file): header \(header.count) B, \(frames.count) frames, keyframes at \(keyIdx.prefix(8).map(String.init).joined(separator: ","))…, avg frame \(frames.isEmpty ? 0 : frames.reduce(0) { $0 + $1.bytes.count } / frames.count) B")
+
+// MARK: - Stream capture (PSCAP1)
+
+/// Writes a PSCAP1 file from the loaded elementary stream with arrival times from the arrival model
+/// (pattern / jitter / stalls / slips options), header first, like the protocol core delivers it.
+if let out = opt.makeCapture {
+	let fps = opt.sendFPS ?? Double(opt.fps)
+	let model = ArrivalModel(seed: opt.seed, interval: 1 / fps)
+	let n = min(frames.count * (opt.loop ? 100 : 1), Int(opt.seconds * fps))
+	var records = [StreamCaptureRecord(arrivalNanoseconds: 0, framesLost: 0, frameRecovered: false, data: Data(header))]
+	let order = (0..<n).map { i -> Int in opt.loop ? (i < frames.count ? i : (keyIdx.first ?? 0) + (i - frames.count) % (frames.count - (keyIdx.first ?? 0))) : i }
+	for (k, i) in order.enumerated() {
+		let t = 0.005 + model.arrival(k)
+		records.append(StreamCaptureRecord(arrivalNanoseconds: UInt64(t * 1e9), framesLost: 0, frameRecovered: false, data: Data(frames[i].bytes)))
+	}
+	let profile = StreamProfile(width: 1920, height: 1080, fps: Int(fps), bitrateKbps: 30000, codec: opt.codec)
+	try! StreamCaptureFile.write(header: StreamCaptureHeader(profile: profile, startedAt: Date(), notes: "synthetic: \(opt.file) pattern=\(opt.pattern) jitter=\(opt.jitterMs) bunch=\(opt.bunch) stall=\(opt.stallEveryMs)/\(opt.stallMinMs)-\(opt.stallMaxMs) slips=\(opt.slipEveryMs)"),
+	                             records: records, to: URL(fileURLWithPath: out))
+	print("wrote \(out): \(records.count) records, \(String(format: "%.1f", Double(records.last!.arrivalNanoseconds) / 1e9)) s")
+	exit(0)
+}
+
+/// Replay source: a PSCAP1 file (header record first, then frames with their recorded arrival times).
+var replay: (header: StreamCaptureHeader, records: [StreamCaptureRecord])?
+if let f = opt.captureFile {
+	do {
+		replay = try StreamCaptureFile.read(from: URL(fileURLWithPath: f))
+		log("replay \(f): \(replay!.records.count) records, profile \(replay!.header.profile.width)x\(replay!.header.profile.height)@\(replay!.header.profile.fps) \(replay!.header.profile.codec), notes: \(replay!.header.notes)")
+	} catch {
+		print("cannot read capture: \(error)")
+		exit(1)
+	}
+}
 
 // MARK: - Pipeline
 
@@ -333,6 +382,9 @@ if let v = opt.maxDelayMs { pipeline.maximumPlayoutDelayMs = v }
 pipeline.upscaler = opt.upscaler
 pipeline.upscalerSharpness = opt.sharpness
 pipeline.frameGenerationMethod = opt.fgMethod
+for (k, v) in opt.tunableSets {
+	print("set \(k)=\(v): \(pipeline.setDebugTunable(k, to: v) ? "ok" : "REJECTED")")
+}
 pipeline.frameGeneration = opt.frameGen
 let detectEval = opt.detectTruth.map { DetectEval(truthPath: $0) }
 let interpEval = opt.fgEval ? InterpEval(dumpDir: opt.dumpDir) : nil
@@ -409,6 +461,8 @@ final class ArrivalModel {
 		let ideal = Double(i) * interval
 		var t = ideal + uniform(0, 0.0003)
 		if opt.pattern == "jitter" || opt.pattern == "live" { t += uniform(0, opt.jitterMs / 1000) }
+		// Bunching (Wi-Fi aggregation / sender batching): this frame is held and arrives with the next one.
+		if opt.bunch > 0 && uniform(0, 1) < opt.bunch { t += interval }
 		// The console misses a frame every slipEveryMs: its timeline moves one interval later for good.
 		if opt.slipEveryMs > 0 { t += (ideal * 1000 / opt.slipEveryMs).rounded(.down) * interval }
 		if let s = stalls.first(where: { ideal >= $0.start && ideal < $0.end }) {
@@ -479,6 +533,9 @@ final class FeedResult {
 }
 let result = FeedResult()
 var streamStartHost = 0.0
+var replayWakeLate: [Double] = []
+var captureDone = true
+var replayInside: [Double] = []
 let resultLock = NSLock()
 
 /// The real network thread is woken by socket I/O; a timer-driven harness thread gets coalesced
@@ -501,6 +558,48 @@ let harnessActivity = ProcessInfo.processInfo.beginActivity(options: [.userIniti
 
 let feeder = Thread {
 	makeFeederRealtime()
+	if let rp = replay {
+		// Replay a PSCAP1 capture with its recorded arrival times (or a steady cadence with --steady).
+		pipeline.videoStreamWillStart(profile: rp.header.profile)
+		var tb = mach_timebase_info_data_t()
+		mach_timebase_info(&tb)
+		let start = mach_absolute_time() + UInt64(0.05 * 1e9 * Double(tb.denom) / Double(tb.numer))
+		streamStartHost = Double(start) * Double(tb.numer) / Double(tb.denom) / 1e9
+		let interval = 1.0 / Double(max(1, rp.header.profile.fps))
+		var buf = [UInt8](repeating: 0, count: 1 << 22)
+		for (i, r) in rp.records.enumerated() {
+			let t = opt.steady ? (i == 0 ? 0 : 0.005 + Double(i - 1) * interval) : Double(r.arrivalNanoseconds) / 1e9
+			if t > opt.seconds + 0.01 && opt.seconds > 0 { break }
+			let due = start + UInt64(t * 1e9 * Double(tb.denom) / Double(tb.numer))
+			// Sleep until 3 ms before, then spin: timer wake-ups on a busy machine come tens of ms late,
+			// a spinning time-constraint thread does not (the real network thread is woken by socket I/O).
+			let spinFrom = due &- UInt64(3e6 * Double(tb.denom) / Double(tb.numer))
+			_ = spinFrom
+			while mach_absolute_time() < due {}
+			let woke = mach_absolute_time()
+			if buf.count < r.data.count + 64 { buf = [UInt8](repeating: 0, count: r.data.count + 64) }
+			defer {
+				let done = mach_absolute_time()
+				let toMs = Double(tb.numer) / Double(tb.denom) / 1e6
+				replayWakeLate.append(Double(woke &- min(woke, due)) * toMs)
+				replayInside.append(Double(done - woke) * toMs)
+			}
+			let ok: Bool = buf.withUnsafeMutableBytes { b in
+				r.data.copyBytes(to: b.bindMemory(to: UInt8.self).baseAddress!, count: r.data.count)
+				memset(b.baseAddress! + r.data.count, 0, 64)
+				return pipeline.videoStreamDidReceive(accessUnit: UnsafeRawBufferPointer(start: b.baseAddress!, count: r.data.count), framesLost: r.framesLost, frameRecovered: r.frameRecovered)
+			}
+			resultLock.lock()
+			result.delivered += 1
+			if !ok && i > 0 { result.falseReturns.append(i) }
+			resultLock.unlock()
+		}
+		Thread.sleep(forTimeInterval: 0.3)
+		resultLock.lock()
+		result.done = true
+		resultLock.unlock()
+		return
+	}
 	let padding = 64
 	var scratch = [UInt8](repeating: 0, count: 4 << 20)
 	func deliver(_ bytes: [UInt8], lost: Int, extraZeros: Int = 0) -> Bool {
@@ -836,6 +935,15 @@ if let t = opt.switchPacingAt {
 		log("pacing switched to \(pipeline.pacingMode.rawValue)")
 	}
 }
+if let dir = opt.captureFramesDir {
+	DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+		captureDone = false
+		pipeline.capturePresentedFrames(count: 12, to: URL(fileURLWithPath: dir)) { urls in
+			log("captured \(urls.count) presented pictures -> \(dir)")
+			captureDone = true
+		}
+	}
+}
 feeder.start()
 var lastPrint = CACurrentMediaTime()
 var shotTaken = false
@@ -882,6 +990,21 @@ if let q = opt.qualityRef {
 } else if let dir = opt.dumpDir, let pb = pipeline.copyLastDecodedPixelBuffer() {
 	try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
 	verifyAndDump(pb, dir: dir)
+}
+if opt.captureFramesDir != nil {
+	let until = Date().addingTimeInterval(60)
+	while !captureDone && Date() < until { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
+}
+if !replayWakeLate.isEmpty {
+	let w = replayWakeLate.sorted(), d = replayInside.sorted()
+	log(String(format: "replay timing: wake-up lateness med %.2f p95 %.2f max %.2f ms; time inside videoStreamDidReceive med %.2f p95 %.2f max %.2f ms",
+	           w[w.count / 2], w[Int(Double(w.count) * 0.95)], w.last!, d[d.count / 2], d[Int(Double(d.count) * 0.95)], d.last!))
+}
+if let tr = opt.traceOut {
+	do {
+		let n = try pipeline.writeFrameTrace(to: URL(fileURLWithPath: tr), lastSeconds: 3600)
+		log("trace: \(n) records -> \(tr)")
+	} catch { log("trace write failed: \(error)") }
 }
 summarizePresentation()
 summarizeSchedule()

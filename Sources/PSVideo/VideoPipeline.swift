@@ -30,16 +30,24 @@ public final class VideoPipeline: VideoStreamSink {
 	/// Lower bound of the adaptive playout delay, ms. Default 16.7 (one frame at 60 fps): the delay a
 	/// clean link settles at. Any thread, takes effect on the next frame.
 	public var minimumPlayoutDelayMs: Double {
-		get { pacingLock.withLock { pacing.minMs } }
-		set { pacingLock.withLock { pacing.minMs = max(0, newValue); pacing.maxMs = max(pacing.maxMs, pacing.minMs) } }
+		get { tunables.get("pacer.minDelayMs") ?? 16.7 }
+		set {
+			let v = min(200, max(0, newValue))
+			tunables.set("pacer.minDelayMs", v)
+			if (tunables.get("pacer.maxDelayMs") ?? 50) < v { tunables.set("pacer.maxDelayMs", v) }
+		}
 	}
 
 	/// Upper bound of the adaptive playout delay, ms. Default 50. Stalls longer than this are not
 	/// hidden: the picture holds, then catches up (and skips frames if far behind). Raise it (e.g.
 	/// 120) to ride out ~100 ms Wi-Fi stalls completely at the cost of that much latency.
 	public var maximumPlayoutDelayMs: Double {
-		get { pacingLock.withLock { pacing.maxMs } }
-		set { pacingLock.withLock { pacing.maxMs = max(0, newValue); pacing.minMs = min(pacing.minMs, pacing.maxMs) } }
+		get { tunables.get("pacer.maxDelayMs") ?? 50 }
+		set {
+			let v = min(500, max(0, newValue))
+			tunables.set("pacer.maxDelayMs", v)
+			if (tunables.get("pacer.minDelayMs") ?? 16.7) > v { tunables.set("pacer.minDelayMs", v) }
+		}
 	}
 
 	/// Upscaling of the picture to the display's pixel size. Main thread, takes effect on the next frame.
@@ -142,7 +150,13 @@ public final class VideoPipeline: VideoStreamSink {
 	private var streaming = false
 	private var activity: NSObjectProtocol?
 
-	private let pacer = FramePacer()
+	/// Live-adjustable internals (see Tunables.specs); shared with the renderer, generator and scaler.
+	let tunables = Tunables()
+	/// Always-on per-frame trace (last ~16k records).
+	let trace = FrameTrace()
+	private var traceSeq = 0
+	private var lastRebases = 0
+	private lazy var pacer = FramePacer(tunables: tunables)
 	private let debugSubmit = ProcessInfo.processInfo.environment["PSVIDEO_DEBUG_FG"] != nil
 	private var lastCallEnd: UInt64 = 0
 	private var lastArrivalTicks: UInt64 = 0
@@ -165,6 +179,8 @@ public final class VideoPipeline: VideoStreamSink {
 		nals.reserveCapacity(64)
 		pacing = PacingSettings(mode: pacingMode)
 		renderer = Self.makeRenderer(displayMode, stats: collector)
+		renderer.tunables = tunables
+		renderer.trace = trace
 		renderer.setPacing(pacingMode)
 		collector.update { $0.pacingMode = pacingMode }
 		collector.reset(codec: nil, mode: displayMode)
@@ -304,15 +320,30 @@ public final class VideoPipeline: VideoStreamSink {
 		// The pacer always runs (arrival jitter stats are useful with pacing off too); its schedule is
 		// only used in adaptive mode.
 		let settings = pacingLock.withLock { pacing }
-		pacer.minDelay = settings.minMs / 1000
-		pacer.maxDelay = settings.maxMs / 1000
 		var schedule = pacer.schedule(arrival: hostSeconds(arrival), framesLost: framesLost)
 		schedule.discontinuity = framesLost > 0 || frameRecovered
+		traceSeq += 1
+		var rec = TraceRecord()
+		rec.kind = .frame
+		rec.seq = traceSeq
+		rec.arrival = hostSeconds(arrival)
+		rec.delayMs = schedule.pacerDelay * 1000
+		if schedule.late { rec.flags.insert(.late) }
+		if schedule.skip { rec.flags.insert(.skip); rec.shown = .skipped }
+		if schedule.outlier { rec.flags.insert(.outlier) }
+		if schedule.discontinuity { rec.flags.insert(.discontinuity) }
+		if keyframe { rec.flags.insert(.keyframe) }
+		if settings.mode == .adaptive, let t = schedule.target { rec.target = t }
+		schedule.traceID = trace.add(rec)
+		if pacer.rebases != lastRebases {
+			lastRebases = pacer.rebases
+			trace.event(.pacerRebase, value: (schedule.target ?? 0) > 0 ? schedule.pacerDelay * 1000 : .nan, seq: traceSeq)
+		}
 		if settings.mode == .adaptive {
 			if schedule.late { lateFrames += 1 }
 			if schedule.skip { skippedFrames += 1 }
 		} else {
-			schedule = FrameSchedule(target: nil, skip: false, late: false, interval: schedule.interval, discontinuity: schedule.discontinuity)
+			schedule = FrameSchedule(target: nil, skip: false, late: false, interval: schedule.interval, discontinuity: schedule.discontinuity, outlier: schedule.outlier, traceID: schedule.traceID)
 		}
 		scheduleObserver?(hostSeconds(arrival), schedule.target ?? .nan, schedule.skip)
 		publishPacing(settings.mode, now: arrival)
@@ -435,6 +466,8 @@ public final class VideoPipeline: VideoStreamSink {
 		let current = rendererLock.withLock { renderer }
 		guard current.mode != mode else { return }
 		let new = Self.makeRenderer(mode, stats: collector)
+		new.tunables = tunables
+		new.trace = trace
 		new.setPacing(pacingMode)
 		new.setUpscaler(upscalerSetting)
 		(new as? MetalVideoRenderer)?.setSharpness(upscalerSharpness)
@@ -512,11 +545,12 @@ public final class VideoPipeline: VideoStreamSink {
 	public static func simulatePacing(arrivals: [Double], fps: Int, minDelayMs: Double, maxDelayMs: Double, robust: Bool = true)
 		-> (frames: [(target: Double, delay: Double, late: Bool, skip: Bool)], rebases: Int)
 	{
-		let p = FramePacer()
+		let tun = Tunables()
+		tun.set("pacer.minDelayMs", minDelayMs)
+		tun.set("pacer.maxDelayMs", maxDelayMs)
+		let p = FramePacer(tunables: tun)
 		p.robustOutliers = robust
 		p.reset(fps: fps)
-		p.minDelay = minDelayMs / 1000
-		p.maxDelay = maxDelayMs / 1000
 		var out: [(Double, Double, Bool, Bool)] = []
 		for a in arrivals {
 			let s = p.schedule(arrival: a, framesLost: 0)
@@ -610,5 +644,42 @@ extension VideoPipeline {
 		      let o = r.renderOffscreen(pb, matrix: colorInfo?.matrix ?? (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String), hdr: colorInfo?.isHDR ?? false)
 		else { return nil }
 		return (o.width, o.height, o.rgba)
+	}
+}
+
+
+// MARK: - VideoDebugControlling
+
+extension VideoPipeline: VideoDebugControlling {
+	public func debugTunables() -> [String: Double] {
+		tunables.all()
+	}
+
+	public func setDebugTunable(_ name: String, to value: Double) -> Bool {
+		guard tunables.set(name, value) else { return false }
+		if name == "scaler.sharpness" { onMain { [weak self] in if let self, self.upscalerSharpness != value { self.upscalerSharpness = value } } }
+		return true
+	}
+
+	public func writeFrameTrace(to url: URL, lastSeconds: Double) throws -> Int {
+		let s = stats
+		let extra: [String: Any] = [
+			"display_mode": s.displayMode.rawValue, "pacing": s.pacingMode.rawValue, "upscaler": s.activeUpscaler.rawValue,
+			"frame_generation": s.frameGeneration.rawValue, "frame_generation_method": s.frameGenerationMethod.rawValue,
+			"codec": s.codec.map { "\($0)" } ?? "", "width": s.width, "height": s.height, "hdr": s.hdrActive,
+			"display_refresh_hz": s.displayRefreshHz ?? 0, "reasons": s.frameGenerationReasons,
+		]
+		return try trace.write(to: url, lastSeconds: lastSeconds, tunables: tunables.all(), extra: extra)
+	}
+
+	public func capturePresentedFrames(count: Int, to directory: URL, completion: @escaping @Sendable ([URL]) -> Void) {
+		let r = rendererLock.withLock { renderer }
+		if let m = r as? MetalVideoRenderer {
+			m.startCapture(count: count, directory: directory, completion: completion)
+		} else if let l = r as? SampleBufferLayerRenderer {
+			l.startCapture(count: count, directory: directory, hdr: colorInfo?.isHDR ?? false, completion: completion)
+		} else {
+			completion([])
+		}
 	}
 }

@@ -54,6 +54,9 @@ final class MotionExtrapolator {
 	private var pool: CVPixelBufferPool?
 	private var poolKey = (0, 0, OSType(0))
 
+	/// Live-adjustable internals (search ranges, confidence and overlay thresholds).
+	var tunables = Tunables()
+
 	/// GPU time of the last estimate / warp (excluding queueing), ms.
 	private(set) var lastGPUms = 0.0
 	private(set) var lastWarpGPUms = 0.0
@@ -153,7 +156,8 @@ final class MotionExtrapolator {
 		let tg = MTLSize(width: 8, height: 8, depth: 1)
 		// 1/16: exhaustive +-8 (= +-128 full-res px).
 		var cdims = SIMD4<Int32>(Int32(cw), Int32(ch), Int32(cw), Int32(ch))
-		var range = Int32(8)
+		let tv = tunables.values
+		var range = Int32(tv.exSearchRange16)
 		enc.setComputePipelineState(coarse)
 		enc.setTexture(pc.q16, index: 0); enc.setTexture(pp.q16, index: 1)
 		enc.setBuffer(coarseBuf, offset: 0, index: 0)
@@ -162,7 +166,7 @@ final class MotionExtrapolator {
 		enc.dispatchThreads(MTLSize(width: cw, height: ch, depth: 1), threadsPerThreadgroup: tg)
 		// 1/8: refine +-2 around the coarse candidates.
 		var mdims = SIMD4<Int32>(Int32(cw), Int32(ch), Int32(mw), Int32(mh))
-		var r2 = Int32(2)
+		var r2 = Int32(tv.exRefineRange8)
 		enc.setComputePipelineState(refine)
 		enc.setTexture(pc.q8, index: 0); enc.setTexture(pp.q8, index: 1)
 		enc.setBuffer(coarseBuf, offset: 0, index: 0)
@@ -172,7 +176,7 @@ final class MotionExtrapolator {
 		enc.dispatchThreads(MTLSize(width: mw, height: mh, depth: 1), threadsPerThreadgroup: tg)
 		// 1/4: refine +-1.
 		var fdims = SIMD4<Int32>(Int32(mw), Int32(mh), Int32(fw), Int32(fh))
-		var r1 = Int32(1)
+		var r1 = Int32(tv.exRefineRange4)
 		enc.setTexture(pc.q4, index: 0); enc.setTexture(pp.q4, index: 1)
 		enc.setBuffer(midBuf, offset: 0, index: 0)
 		enc.setBuffer(fineBuf, offset: 0, index: 3)
@@ -196,7 +200,8 @@ final class MotionExtrapolator {
 		// are protected by the guard in the warp.
 		let f = filteredBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: fw * fh)
 		var gx: [Float] = [], gy: [Float] = []
-		for i in 0..<(fw * fh) where f[i].w >= 0.5 { gx.append(f[i].x); gy.append(f[i].y) }
+		let changedSad = Float(tv.exChangedBlockSad)
+		for i in 0..<(fw * fh) where f[i].w >= changedSad { gx.append(f[i].x); gy.append(f[i].y) }
 		gx.sort(); gy.sort()
 		var global = SIMD2<Float>(gx.isEmpty ? 0 : gx[gx.count / 2], gy.isEmpty ? 0 : gy[gy.count / 2])
 		guard let cmd2 = queue.makeCommandBuffer(), let enc2 = cmd2.makeComputeCommandEncoder() else { return nil }
@@ -204,6 +209,8 @@ final class MotionExtrapolator {
 		enc2.setBuffer(filteredBuf, offset: 0, index: 6)
 		enc2.setBytes(&dims, length: 16, index: 1)
 		enc2.setBytes(&global, length: 8, index: 2)
+		var fillParams = SIMD2<Float>(changedSad, Float(tv.exBlockConfidence))
+		enc2.setBytes(&fillParams, length: 8, index: 3)
 		enc2.setTexture(motionTex, index: 0)
 		enc2.dispatchThreads(MTLSize(width: fw, height: fh, depth: 1), threadsPerThreadgroup: tg)
 		enc2.endEncoding()
@@ -262,6 +269,8 @@ final class MotionExtrapolator {
 		let ten = Self.tenBit(cur)
 		var keep: [CVMetalTexture] = []
 		var u = SIMD4<Float>(factor, Float(Self.fullBlock), Float(fineSize.0), Float(fineSize.1))
+		let tv = tunables.values
+		var ov = SIMD2<Float>(Float(tv.exOverlayRatio), Float(tv.exOverlayMaxCodes / 255))
 		for plane in 0..<2 {
 			guard let c = planeTexture(cur, plane), let p = planeTexture(prev, plane), let d = planeTexture(o, plane) else { return nil }
 			keep += [c, p, d]
@@ -275,6 +284,7 @@ final class MotionExtrapolator {
 			enc.setFragmentTexture(CVMetalTextureGetTexture(p), index: 1)
 			enc.setFragmentTexture(motionTex, index: 2)
 			enc.setFragmentBytes(&u, length: 16, index: 0)
+			enc.setFragmentBytes(&ov, length: 8, index: 1)
 			enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 			enc.endEncoding()
 		}
@@ -394,13 +404,15 @@ final class MotionExtrapolator {
 
 	// Motion texture for the warp: blocks that changed keep their vector (confidence 0 if the match does
 	// not explain the change); blocks that did not change take the global motion.
+	// p = (changed-block SAD threshold, block confidence ratio)
 	kernel void mx_fill(device const float4 *filtered [[buffer(6)]], constant int4 &dims [[buffer(1)]], constant float2 &global [[buffer(2)]],
+	                    constant float2 &p [[buffer(3)]],
 	                    texture2d<float, access::write> motion [[texture(0)]], uint2 g [[thread_position_in_grid]]) {
 		if (int(g.x) >= dims.z || int(g.y) >= dims.w) return;
 		float4 v = filtered[g.y * dims.z + g.x];
-		bool changed = v.w >= 0.5;
+		bool changed = v.w >= p.x;
 		float2 d = changed ? v.xy : global;
-		float conf = (!changed || v.z < 0.6 * v.w) ? 1.0 : 0.0;
+		float conf = (!changed || v.z < p.y * v.w) ? 1.0 : 0.0;
 		motion.write(float4(d, conf, 0.0), g);
 	}
 
@@ -422,7 +434,7 @@ final class MotionExtrapolator {
 
 	// Overlay test at q: does "static" (C = P at q) explain the picture clearly better than "moved with the
 	// motion" (C(q) = P(q + d))? HUD, minimap, subtitles are static over a moving scene.
-	bool overlay_y(texture2d<float> cur, texture2d<float> prev, float2 q, float2 d, float2 size) {
+	bool overlay_y(texture2d<float> cur, texture2d<float> prev, float2 q, float2 d, float2 size, float2 ov) {
 		constexpr sampler ls(filter::linear, address::clamp_to_edge);
 		float sStatic = 0.0, sMove = 0.0;
 		float2 offs[5] = { float2(0, 0), float2(-2, 0), float2(2, 0), float2(0, -2), float2(0, 2) };
@@ -432,10 +444,10 @@ final class MotionExtrapolator {
 			sStatic += abs(c - prev.sample(ls, t / size).r);
 			sMove += abs(c - prev.sample(ls, (t + d) / size).r);
 		}
-		return sStatic < 0.6 * sMove && sStatic < 5.0 * 6.0 / 255.0;
+		return sStatic < ov.x * sMove && sStatic < 5.0 * ov.y;
 	}
 
-	bool overlay_c(texture2d<float> cur, texture2d<float> prev, float2 q, float2 d, float2 size) {
+	bool overlay_c(texture2d<float> cur, texture2d<float> prev, float2 q, float2 d, float2 size, float2 ov) {
 		constexpr sampler ls(filter::linear, address::clamp_to_edge);
 		float sStatic = 0.0, sMove = 0.0;
 		float2 offs[5] = { float2(0, 0), float2(-1, 0), float2(1, 0), float2(0, -1), float2(0, 1) };
@@ -446,33 +458,33 @@ final class MotionExtrapolator {
 			sStatic += a.x + a.y;
 			sMove += b.x + b.y;
 		}
-		return sStatic < 0.6 * sMove && sStatic < 10.0 * 6.0 / 255.0;
+		return sStatic < ov.x * sMove && sStatic < 10.0 * ov.y;
 	}
 
 	// Copy overlays; warp everything else from where it comes from, except when that source is an overlay
 	// (then keep the current pixel rather than drag the HUD along with the scene).
 	fragment float mx_warp_y(MXOut in [[stage_in]], texture2d<float> cur [[texture(0)]], texture2d<float> prev [[texture(1)]],
-	                         texture2d<float> motion [[texture(2)]], constant float4 &u [[buffer(0)]]) {
+	                         texture2d<float> motion [[texture(2)]], constant float4 &u [[buffer(0)]], constant float2 &ov [[buffer(1)]]) {
 		constexpr sampler ls(filter::linear, address::clamp_to_edge);
 		float2 size = float2(cur.get_width(), cur.get_height());
 		float2 p = in.position.xy;
 		float4 mv = motion_at(motion, p, u);
-		if (overlay_y(cur, prev, p, mv.xy, size)) return cur.sample(ls, p / size).r;
+		if (overlay_y(cur, prev, p, mv.xy, size, ov)) return cur.sample(ls, p / size).r;
 		float2 src = p + u.x * mv.z * mv.xy;
-		if (overlay_y(cur, prev, src, mv.xy, size)) return cur.sample(ls, p / size).r;
+		if (overlay_y(cur, prev, src, mv.xy, size, ov)) return cur.sample(ls, p / size).r;
 		return cur.sample(ls, src / size).r;
 	}
 
 	fragment float2 mx_warp_c(MXOut in [[stage_in]], texture2d<float> cur [[texture(0)]], texture2d<float> prev [[texture(1)]],
-	                          texture2d<float> motion [[texture(2)]], constant float4 &u [[buffer(0)]]) {
+	                          texture2d<float> motion [[texture(2)]], constant float4 &u [[buffer(0)]], constant float2 &ov [[buffer(1)]]) {
 		constexpr sampler ls(filter::linear, address::clamp_to_edge);
 		float2 size = float2(cur.get_width(), cur.get_height());
 		float2 p = in.position.xy;
 		float4 mv = motion_at(motion, p * 2.0, u); // chroma pixel -> luma pixel position
 		float2 dc = mv.xy * 0.5;
-		if (overlay_c(cur, prev, p, dc, size)) return cur.sample(ls, p / size).rg;
+		if (overlay_c(cur, prev, p, dc, size, ov)) return cur.sample(ls, p / size).rg;
 		float2 src = p + u.x * mv.z * dc;
-		if (overlay_c(cur, prev, src, dc, size)) return cur.sample(ls, p / size).rg;
+		if (overlay_c(cur, prev, src, dc, size, ov)) return cur.sample(ls, p / size).rg;
 		return cur.sample(ls, src / size).rg;
 	}
 	"""
