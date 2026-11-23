@@ -30,6 +30,10 @@ final class StreamController: ObservableObject {
 
 	@Published private(set) var phase: Phase = .connecting
 	@Published private(set) var liveStats = LiveStats()
+	/// Recent samples for the overlay graphs, oldest first.
+	@Published private(set) var history: [StatsSample] = []
+	static let historyLength = 160
+	private static let statsInterval: TimeInterval = 0.25
 	@Published private(set) var cantDisplay = false
 	@Published var pinRequest: PINRequest?
 	@Published private(set) var consoleName: String
@@ -98,7 +102,7 @@ final class StreamController: ObservableObject {
 			options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled, .userInitiated, .latencyCritical],
 			reason: "Streaming from \(configuration.host.nickname)"
 		)
-		statsTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+		statsTimer = Timer.scheduledTimer(withTimeInterval: Self.statsInterval, repeats: true) { [weak self] _ in
 			MainActor.assumeIsolated { self?.refreshStats() }
 		}
 		CoreLog.note("Session started: \(configuration.profile.width)x\(configuration.profile.height)@\(configuration.profile.fps) \(configuration.profile.codec) \(configuration.profile.bitrateKbps) kbit/s, renderer \(video.displayMode.rawValue), start bitrate hint \(configuration.startBitrateHint)")
@@ -185,9 +189,23 @@ final class StreamController: ObservableObject {
 		stats.session = session.stats()
 		liveStats = stats
 
+		// Pictures reaching the screen per second: real ones plus generated ones.
+		let generating = stats.video.frameGeneration != .off
+		let outputFPS = stats.video.decodedFPS + (generating ? stats.video.generatedFPS : 0)
+		let nominalFrameTime = outputFPS > 1 ? 1000 / outputFPS : 0
+		history.append(StatsSample(
+			outputFPS: outputFPS,
+			frameTimeMs: stats.video.presentedIntervalAvgMs ?? nominalFrameTime,
+			frameTimeMaxMs: stats.video.presentedIntervalMaxMs ?? nominalFrameTime,
+			latencyMs: stats.video.glassAvgMs,
+			bitrateMbps: stats.session.measuredBitrate / 1_000_000,
+			arrivalGapMs: stats.video.arrivalMaxGapMs
+		))
+		if history.count > Self.historyLength { history.removeFirst(history.count - Self.historyLength) }
+
 		// Every 5 s leave a line in the log, so stutter reports can be diagnosed after the fact.
 		statsTick += 1
-		guard statsTick % 10 == 0, phase == .streaming else { return }
+		guard statsTick % Int(5 / Self.statsInterval) == 0, phase == .streaming else { return }
 		let v = stats.video
 		let audioText = stats.audio.map { String(format: "audio buf %.0f ms target %.0f ms gap max %.0f ms underruns %d", $0.bufferedMs, $0.targetMs, $0.longestGapMs, $0.underruns) } ?? "audio -"
 		let layerDelay = v.layerFrameDelayMs.map { String(format: "%.1f", $0) } ?? "-"

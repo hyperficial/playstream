@@ -48,7 +48,9 @@ struct StreamView: View {
 
 			VStack {
 				HStack(alignment: .top) {
-					if settings.showStats { StatsOverlay(stats: controller.liveStats, profile: controller.configuration.profile) }
+					if let level = StatsLevel(rawValue: settings.statsLevel), level != .off {
+						StatsOverlay(stats: controller.liveStats, history: controller.history, profile: controller.configuration.profile, level: level)
+					}
 					Spacer()
 					if recorder.state.isBusy { RecordingBadge(recorder: recorder) }
 				}
@@ -84,12 +86,12 @@ struct StreamView: View {
 			.help("Record to ~/Movies/PlayStream (⌘R)")
 
 			Button {
-				settings.showStats.toggle()
+				settings.statsLevel = (StatsLevel(rawValue: settings.statsLevel) ?? .off).next.rawValue
 			} label: {
 				Label("Stats", systemImage: "chart.bar.xaxis")
 			}
 			.keyboardShortcut("i", modifiers: .command)
-			.help("Show stream statistics (⌘I)")
+			.help("Stream statistics: off, compact, full (⌘I)")
 
 			Button {
 				NSApp.keyWindow?.toggleFullScreen(nil)
@@ -193,49 +195,6 @@ private struct RecordingBadge: View {
 			let seconds = Int(recorder.elapsed)
 			let megabytes = Double(recorder.bytesWritten) / 1_000_000
 			return String(format: "%02d:%02d  %.0f MB", seconds / 60, seconds % 60, megabytes)
-		}
-	}
-}
-
-private struct StatsOverlay: View {
-	let stats: StreamController.LiveStats
-	let profile: StreamProfile
-
-	var body: some View {
-		VStack(alignment: .leading, spacing: 3) {
-			row("Video", "\(stats.video.width)×\(stats.video.height)  \(String(format: "%.0f", stats.video.decodedFPS)) fps  \(stats.video.hdrActive ? "HDR" : "SDR")")
-			row("Bitrate", String(format: "%.1f Mbit/s (asked %.0f)", stats.session.measuredBitrate / 1_000_000, Double(profile.bitrateKbps) / 1000))
-			row("Network", String(format: "loss %.1f%%  rtt %.0f ms", stats.session.packetLoss * 100, stats.session.rttMilliseconds))
-			row("Frames", "lost \(stats.video.framesLostInNetwork)  dropped \(stats.video.framesDropped)  recovered \(stats.video.framesRecovered)")
-			if stats.video.activeUpscaler != .off {
-				row("Upscale", "\(stats.video.activeUpscaler.rawValue) to \(stats.video.upscaleOutputWidth)×\(stats.video.upscaleOutputHeight)")
-			}
-			if stats.video.frameGeneration != .off {
-				row("Frame gen", String(format: "%@  game %.0f fps  +%.0f/s  hold %.0f ms", "\(stats.video.frameGenerationMethod)", stats.video.contentFPS, stats.video.generatedFPS, stats.video.frameGenerationAddedLatencyMs))
-			}
-			if let decode = stats.video.decodeTimeAvgMs {
-				row("Decode", String(format: "%.1f ms", decode))
-			}
-			row("Arrival", String(format: "jitter %.1f ms  longest gap %.0f ms", stats.video.arrivalJitterP95Ms, stats.video.arrivalMaxGapMs))
-			row("Pacing", stats.video.pacingMode == .off ? "off" : String(format: "delay %.0f ms  late %d  skipped %d", stats.video.playoutDelayMs, stats.video.framesLate, stats.video.framesSkipped))
-			if let glass = stats.video.glassAvgMs {
-				row("To glass", String(format: "%.1f ms", glass))
-			}
-			if let audio = stats.audio {
-				row("Audio", String(format: "buffer %.0f/%.0f ms  out %.0f ms  underruns %d", audio.bufferedMs, audio.targetMs, audio.outputLatencyMs, audio.underruns))
-				row("Link gaps", String(format: "longest %.0f ms in the last 10 s", audio.longestGapMs))
-			}
-		}
-		.font(.caption.monospacedDigit())
-		.padding(10)
-		.background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-		.foregroundStyle(.white)
-	}
-
-	private func row(_ title: String, _ value: String) -> some View {
-		HStack(spacing: 8) {
-			Text(title).foregroundStyle(.white.opacity(0.6)).frame(width: 62, alignment: .leading)
-			Text(value)
 		}
 	}
 }

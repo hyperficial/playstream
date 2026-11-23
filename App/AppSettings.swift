@@ -44,7 +44,8 @@ final class AppSettings: ObservableObject {
 	@AppStorage("stream.frameGenerationMethod") var frameGenerationMethod: Int = 0
 	/// Experimental start-bitrate hint: 0 off, 1 variant A, 2 variant B. Applies to the next connection.
 	@AppStorage("stream.startBitrateHint") var startBitrateHint: Int = 0
-	@AppStorage("stream.showStats") var showStats: Bool = false
+	/// 0 off, 1 compact (fps, frame time, graph), 2 full.
+	@AppStorage("stream.statsLevel") var statsLevel: Int = 0
 	@AppStorage("stream.lowLatencyRenderer") var lowLatencyRenderer: Bool = false
 	/// Show frames on a steady cadence (about one frame of delay) instead of the instant they arrive. Applies live.
 	@AppStorage("stream.framePacing") var framePacing: Bool = true
