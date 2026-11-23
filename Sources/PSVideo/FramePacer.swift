@@ -78,6 +78,9 @@ final class FramePacer {
 	var robustOutliers = true
 	/// Times the grid was re-based because the console's frame timeline slipped.
 	private(set) var rebases = 0
+	/// Outliers recognised as bunching (held and delivered with the next frame).
+	private(set) var bunches = 0
+	private var pendingOutlierLate: [Double] = []
 	private var startArrival = 0.0
 	private(set) var delay = 1.0 / 60
 	private(set) var targetDelay = 1.0 / 60
@@ -139,6 +142,17 @@ final class FramePacer {
 		lastArrival = a
 		jitter.push(abs(gap - interval * Double(1 + lost)), limit: statsFrames)
 		gaps.push(gap, limit: statsFrames)
+		// The previous frame was an outlier and this one follows it at once: it was bunched (Wi-Fi
+		// aggregation / sender batching), not a console slip. Its lateness is jitter the buffer should
+		// cover, and it must not count toward a re-base.
+		if !pendingOutlierLate.isEmpty {
+			if gap < t.pacerBunchGapFraction * interval && t.pacerBunchFeedsDelay >= 0.5 {
+				for l in pendingOutlierLate { lateness.push(l, limit: analysisFrames) }
+				bunches += pendingOutlierLate.count
+				slipRun.removeAll()
+			}
+			pendingOutlierLate.removeAll()
+		}
 
 		k += Int64(1 + lost)
 		let o = a - Double(k) * interval
@@ -155,6 +169,7 @@ final class FramePacer {
 		let lowRate = interval > 1.0 / 45
 		let outlier = robustOutliers && late >= t.pacerOutlierFraction * interval && (lowRate || late >= t.pacerOutlierMaxDelayFraction * maxDelay)
 		if outlier {
+			pendingOutlierLate.append(late)
 			slipRun.append(late)
 			if slipRun.count >= Int(t.pacerRebaseCount), let lo = slipRun.min(), let hi = slipRun.max(), hi - lo < t.pacerRebaseSpreadFraction * interval {
 				// Two frames in a row late by the same amount: the console's timeline moved. Re-base the grid
@@ -164,6 +179,7 @@ final class FramePacer {
 				base = o
 				late = 0
 				slipRun.removeAll()
+				pendingOutlierLate.removeAll()
 				rebases += 1
 			}
 		} else {

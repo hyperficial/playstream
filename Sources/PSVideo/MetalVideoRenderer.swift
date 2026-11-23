@@ -109,6 +109,7 @@ final class MetalVideoRenderer: VideoRenderer, @unchecked Sendable {
 		var backingScale = 2.0
 		var overlay: (texture: MTLTexture, originPt: CGPoint, sizePx: CGSize)?
 		var decodeInFlight = 0
+		var lastAnalyzed: CVPixelBuffer?
 	}
 
 	struct Pending {
@@ -192,6 +193,7 @@ final class MetalVideoRenderer: VideoRenderer, @unchecked Sendable {
 		guard let scaler = FrameScaler(device: device) else { return nil }
 		self.scaler = scaler
 		self.compositor = PresentCompositor(device: device)
+		self.contentAnalyzer = ContentAnalyzer(device: device)
 		self.device = device
 		self.commandQueue = queue
 		self.textureCache = cache
@@ -235,6 +237,40 @@ final class MetalVideoRenderer: VideoRenderer, @unchecked Sendable {
 
 	private var appliedLayer = (count: 3, sync: true, hud: false, mode: -1, full: false)
 	private let compositor: PresentCompositor
+	private let contentAnalyzer: ContentAnalyzer?
+	private let contentTracker = ContentRateTracker()
+	private var lastContentPublish = 0.0
+
+	/// Decoder thread: new-or-repeat and histogram for every decoded picture (frame generation uses this).
+	private func analyzeContent(_ image: CVPixelBuffer, traceID: Int?, discontinuity: Bool) -> ContentAnalysis? {
+		guard let an = contentAnalyzer else { return nil }
+		let t = tunables.values
+		let previous = lock.withLock { () -> CVPixelBuffer? in
+			let p = shared.lastAnalyzed
+			shared.lastAnalyzed = image
+			return p
+		}
+		let a = an.analyze(image, previous: discontinuity ? nil : previous, t: t)
+		let now = CACurrentMediaTime()
+		contentTracker.add(isNew: !a.isRepeat, at: now)
+		if let id = traceID, let tr = trace {
+			tr.update(id) { r in r.value = Double(a.changedFraction); r.blockMax = Double(a.maxBlockMean); r.changedBlocks = a.changedBlocks
+				if a.isRepeat { r.flags.insert(.isRepeat) } }
+		}
+		if now - lastContentPublish > 0.25 {
+			lastContentPublish = now
+			let (pps, nps) = contentTracker.rates(now: now)
+			let pattern = contentTracker.pattern, runs = contentTracker.runs
+			stats.update { s in
+				s.contentPicturesPerSecond = pps
+				s.contentNewPerSecond = nps
+				s.contentFPS = nps
+				s.contentPattern = pattern
+				s.contentRepeatRuns = runs
+			}
+		}
+		return a
+	}
 
 	/// Render queue: applies drawable count / display sync / HUD tunables to the layer and notes mode
 	/// changes. Cheap when nothing changed.
@@ -660,7 +696,10 @@ final class MetalVideoRenderer: VideoRenderer, @unchecked Sendable {
 		if full && bounds.width >= 16 && bounds.height >= 16 {
 			// Native-resolution drawable covering the view; the video aspect-fit inside it.
 			let fit = AVMakeRect(aspectRatio: CGSize(width: w, height: h), insideRect: CGRect(origin: .zero, size: bounds)).integral
-			let mode = scaler.effectiveMode(requested, input: (w, h), output: (Int(fit.width), Int(fit.height)))
+			var mode = scaler.effectiveMode(requested, input: (w, h), output: (Int(fit.width), Int(fit.height)))
+			// Upscaler off: the compositor (or the display pipe) used to scale the 1080p drawable; now we
+			// do it. Use Catmull-Rom bicubic rather than the conversion pass's bilinear tap.
+			if mode == .off && (Int(fit.width) > w || Int(fit.height) > h) { mode = .bicubic }
 			plan = Plan(mode: mode, drawableSize: CGSize(width: bounds.width.rounded(), height: bounds.height.rounded()), fullLayer: true, videoRect: fit)
 		} else {
 			let ow = Int(out.width.rounded()), oh = Int(out.height.rounded())
@@ -827,6 +866,7 @@ final class MetalVideoRenderer: VideoRenderer, @unchecked Sendable {
 			shared.lastRequested = 0
 			shared.decodeInFlight = 0
 		}
+		lock.withLock { shared.lastAnalyzed = nil }
 		renderQueue.async { [weak self] in
 			guard let self, let d = self.metalLayer.nextDrawable() else { return }
 			self.clear(d)
@@ -920,6 +960,8 @@ final class MetalVideoRenderer: VideoRenderer, @unchecked Sendable {
 		stats.frameDecoded(decodeMs: StatsCollector.ms(from: submitted, to: now))
 		if let tr = trace, let id = sched?.traceID { tr.update(id) { $0.submitted = hostSeconds(submitted); $0.decoded = hostSeconds(now) } }
 		let arrival = pts.isValid ? CMClockConvertHostTimeToSystemUnits(pts) : submitted
+		let disc = lock.withLock { shared.errorSinceLastFrame } || (sched?.discontinuity ?? false)
+		let analysis = analyzeContent(image, traceID: sched?.traceID, discontinuity: disc)
 		decodedFrameObserver?(image)
 		// Frame generation (paced only): the generator decides what is shown when.
 		if let gen = generator {
@@ -929,8 +971,10 @@ final class MetalVideoRenderer: VideoRenderer, @unchecked Sendable {
 				shared.consecutiveErrors = 0
 				let disc = sc.discontinuity || shared.errorSinceLastFrame
 				shared.errorSinceLastFrame = false
-				return FrameGenerator.Input(buffer: image, arrival: arrival, target: target, interval: sc.interval, skip: sc.skip, discontinuity: disc,
-				                            grid: sc.grid, jitter: sc.jitter, pacerDelay: sc.pacerDelay, traceID: sc.traceID)
+				var inp = FrameGenerator.Input(buffer: image, arrival: arrival, target: target, interval: sc.interval, skip: sc.skip, discontinuity: disc,
+				                               grid: sc.grid, jitter: sc.jitter, pacerDelay: sc.pacerDelay, traceID: sc.traceID)
+				inp.analysis = analysis
+				return inp
 			}
 			if let input {
 				gen.submit(input)

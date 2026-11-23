@@ -100,6 +100,8 @@ public struct VideoStats: Sendable, Equatable {
 	public var framesSkipped: Int = 0
 	/// Times the pacing grid was re-based because the console's frame timeline slipped (it skipped a frame).
 	public var pacerRebases: Int = 0
+	/// Late frames recognised as bunching (delivered together with the next frame): fed to the delay estimate, no re-base.
+	public var pacerBunches: Int = 0
 	/// How far ahead of its target a paced frame is handed to the system so it can make that vsync,
 	/// ms. Learned from feedback (Metal: presented-time misses; layer: the layer's own frame-delay
 	/// metric). This is pipeline latency the immediate path pays as well, not extra buffering.
@@ -243,6 +245,15 @@ public struct VideoStats: Sendable, Equatable {
 	public var decodeLatencyP50Ms: Double?
 	public var decodeLatencyP95Ms: Double?
 	public var decoderInFlightMax: Int = 0
+	// MARK: Content frame rate (Metal path, always on, independent of frame generation)
+
+	/// Decoded stream pictures per second and new (non-repeated) pictures per second, last 2 s.
+	public var contentPicturesPerSecond: Double = 0
+	public var contentNewPerSecond: Double = 0
+	/// Last 30 pictures, oldest first: N = new, R = repeat of the previous picture.
+	public var contentPattern: String = ""
+	/// Cumulative runs of consecutive repeats: [1, 2, 3+] (2+ in a 30-in-60 stream = the game dropped below 30).
+	public var contentRepeatRuns: [Int] = [0, 0, 0]
 	/// Metal performance HUD shown on the video layer.
 	public var metalHUD: Bool = false
 	/// An in-frame overlay image is set.

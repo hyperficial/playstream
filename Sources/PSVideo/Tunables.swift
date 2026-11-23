@@ -18,7 +18,9 @@ struct TunableValues {
 	var pacerWarmupSeconds = 0.5
 	var pacerOutlierFraction = 0.75
 	var pacerOutlierMaxDelayFraction = 0.75
-	var pacerRebaseCount = 2.0
+	var pacerRebaseCount = 3.0
+	var pacerBunchGapFraction = 0.5
+	var pacerBunchFeedsDelay = 1.0
 	var pacerRebaseSpreadFraction = 0.25
 	var pacerBurstSkipFraction = 0.25
 	var pacerRateTolerance = 0.12
@@ -57,6 +59,22 @@ struct TunableValues {
 	var exChangedBlockSad = 0.5
 	var exOverlayRatio = 0.6
 	var exOverlayMaxCodes = 6.0
+	var fgMissShiftsLater = 1.0
+	var fgRunMaxRepeats = 3.0
+	var exMaxRunFactor = 1.0
+	var fgDropHopeless = 1.0
+	var exAlgorithm = 2.0
+	var exMaxShiftPx = 48.0
+	var exFadeShiftPx = 24.0
+	var exColorErr0 = 64.0
+	var exColorErr1 = 128.0
+	var exStaticFrames = 3.0
+	var exStaticLevel = 1.5
+	var exV2MaxResidual = 0.98
+	var exMinFactorScale = 0.35
+	var exCandidates = 4.0
+	var exSearchPredictors = 1.0
+	var exLevelMedian = 1.0
 	// Scaling (FrameScaler).
 	var scalerSharpness = 0.5
 	var scalerMetalFXHDRLinear = 1.0
@@ -71,6 +89,9 @@ struct TunableValues {
 	var presentFullLayer = 0.0
 	var presentHUD = 0.0
 	var presentSampleDisplayUpdates = 0.0
+	// Content frame rate (repeat detection, always on).
+	var contentBlockLevel = 3.0
+	var contentMinBlocks = 3.0
 	// In-frame overlay.
 	var overlayHDRWhiteNits = 100.0
 	var overlayOpacity = 1.0
@@ -134,6 +155,24 @@ final class Tunables: @unchecked Sendable {
 		Spec(name: "ex.changedBlockSad", key: \.exChangedBlockSad, range: 0...64, doc: "block SAD (sum over 8x8, 0..1 luma) below which a block 'did not change'"),
 		Spec(name: "ex.overlayRatio", key: \.exOverlayRatio, range: 0...1, doc: "overlay guard: static error < this x moved error keeps the real pixel"),
 		Spec(name: "ex.overlayMaxCodes", key: \.exOverlayMaxCodes, range: 0...128, doc: "overlay guard: and static error per tap below this many 8-bit codes"),
+		Spec(name: "pacer.bunchGapFraction", key: \.pacerBunchGapFraction, range: 0...1, doc: "an outlier followed within this x interval by the next frame was bunched (held and delivered with it), not a console slip"),
+		Spec(name: "pacer.bunchFeedsDelay", key: \.pacerBunchFeedsDelay, range: 0...1, doc: "1 = a bunched frame's lateness feeds the delay estimate and cannot re-base the grid"),
+		Spec(name: "fg.missShiftsLater", key: \.fgMissShiftsLater, range: 0...1, doc: "interpolation: a generated slot that missed its deadline moves the slot clock one slot later (within the latency budget)"),
+		Spec(name: "fg.dropHopeless", key: \.fgDropHopeless, range: 0...1, doc: "interpolation: a queued slot that cannot finish by its deadline at median processing time falls back at once"),
+		Spec(name: "fg.runMaxRepeats", key: \.fgRunMaxRepeats, range: 1...3, doc: "repeats in a row (game below 30 fps) still filled: interpolation at evenly spaced phases, prediction further ahead (1 = only single repeats)"),
+		Spec(name: "ex.maxRunFactor", key: \.exMaxRunFactor, range: 0.5...2, doc: "prediction distance cap for runs of repeats (content intervals); beyond it the last predicted picture is held rather than stepping back"),
+		Spec(name: "ex.algorithm", key: \.exAlgorithm, range: 1...2, doc: "predict-ahead: 1 = backward block warp with global accept/reject (before), 2 = forward-projected field, per-pixel vector choice and confidence"),
+		Spec(name: "ex.maxShiftPx", key: \.exMaxShiftPx, range: 1...400, doc: "algorithm 2: largest displacement of a predicted pixel (full-res px); larger vectors are compressed toward it"),
+		Spec(name: "ex.fadeShiftPx", key: \.exFadeShiftPx, range: 0...400, doc: "algorithm 2: displacements above this are compressed smoothly toward ex.maxShiftPx"),
+		Spec(name: "ex.colorErr0", key: \.exColorErr0, range: 0...64, doc: "algorithm 2: per-pixel trajectory colour error (8-bit codes, 3-tap mean) with full confidence"),
+		Spec(name: "ex.colorErr1", key: \.exColorErr1, range: 0.5...128, doc: "algorithm 2: colour error at which the displacement has faded to zero"),
+		Spec(name: "ex.staticFrames", key: \.exStaticFrames, range: 1...60, doc: "algorithm 2: a pixel unchanged for this many consecutive pictures is locked (HUD, static background)"),
+		Spec(name: "ex.staticLevel", key: \.exStaticLevel, range: 0...16, doc: "algorithm 2: change (8-bit codes, 1/4-res) below which a pixel counts as unchanged"),
+		Spec(name: "ex.v2MaxResidual", key: \.exV2MaxResidual, range: 0...1, doc: "algorithm 2: a slot is rejected only above this global residual ratio (motion explains almost nothing)"),
+		Spec(name: "ex.minFactorScale", key: \.exMinFactorScale, range: 0...1, doc: "algorithm 2: when the motion changed between intervals, the prediction distance is scaled down to no less than this"),
+		Spec(name: "ex.searchPredictors", key: \.exSearchPredictors, range: 0...1, doc: "algorithm 2: previous field and global motion as extra block-search centres"),
+		Spec(name: "ex.levelMedian", key: \.exLevelMedian, range: 0...1, doc: "algorithm 2: 3x3 vector median at the 1/16 and 1/8 levels before refinement"),
+		Spec(name: "ex.candidates", key: \.exCandidates, range: 1...15, doc: "algorithm 2: per-pixel vector candidates, bit mask: 1 zero, 2 global, 4 backward block vector, 8 forward-projected vectors"),
 		Spec(name: "scaler.sharpness", key: \.scalerSharpness, range: 0...1, doc: "FSR 1 RCAS sharpening (0 = off, 1 = AMD maximum)"),
 		Spec(name: "scaler.metalFXHDRLinear", key: \.scalerMetalFXHDRLinear, range: 0...1, doc: "MetalFX on HDR: 1 = linear-light HDR mode, 0 = PQ values in perceptual mode"),
 		Spec(name: "present.mode", key: \.presentMode, range: 0...2, doc: "Metal presentation: 0 = paced grid (as before), 1 = lowest latency (each picture presented as soon as decoded, newest wins), 2 = smooth (presentAtTime at the pacer's continuous target)"),
@@ -146,6 +185,8 @@ final class Tunables: @unchecked Sendable {
 		Spec(name: "present.fullLayer", key: \.presentFullLayer, range: 0...1, doc: "1 = direct-to-display layout: Metal layer covers the whole view at native pixels, letterbox drawn into the drawable, no painting PSVideo layers"),
 		Spec(name: "present.hud", key: \.presentHUD, range: 0...1, doc: "1 = Apple's Metal performance HUD on the video layer (developerHUDProperties)"),
 		Spec(name: "present.sampleDisplayUpdates", key: \.presentSampleDisplayUpdates, range: 0...1, doc: "1 = poll NSScreen.lastDisplayUpdateTimestamp (~2 kHz, background thread) for display-update cadence stats"),
+		Spec(name: "content.blockLevel", key: \.contentBlockLevel, range: 0.1...64, doc: "repeat test: mean |dY| over a 32x32 block (8-bit codes) above which the block changed"),
+		Spec(name: "content.minBlocks", key: \.contentMinBlocks, range: 1...1000, doc: "repeat test: a picture with fewer changed blocks than this is a repeat of the previous one"),
 		Spec(name: "overlay.hdrWhiteNits", key: \.overlayHDRWhiteNits, range: 20...1000, doc: "in-frame overlay: luminance of overlay white on HDR output (nits; 100 = SDR reference white)"),
 		Spec(name: "overlay.opacity", key: \.overlayOpacity, range: 0...1, doc: "in-frame overlay: global opacity multiplier"),
 	]

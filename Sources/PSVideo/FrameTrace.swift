@@ -95,6 +95,8 @@ struct TraceRecord {
 	var limit = Double.nan
 	var convertMs = Double.nan, motionMs = Double.nan, interpMs = Double.nan, warpMs = Double.nan, guardMs = Double.nan
 	var slackMs = Double.nan      // deadline - completion (ms); negative = missed
+	var blockMax = Double.nan     // frame: largest 32x32 block mean |dY| vs the previous picture (8-bit codes)
+	var changedBlocks = -1        // frame: blocks above content.blockLevel
 }
 
 /// Fixed-size ring of trace records, always on. ~16k records = several minutes at 30 fps, well over
@@ -162,6 +164,7 @@ final class FrameTrace: @unchecked Sendable {
 		"presented": "on glass (host s, Metal path in a window)", "refreshes": "refreshes it stayed on screen",
 		"late": "pacer: arrived after its slot", "skip": "pacer: decoded, not shown (catch-up / burst)",
 		"repeat": "same picture as the previous one (changed < fg.repeatFraction)",
+		"block_max": "largest 32x32-block mean |dY| vs the previous picture (8-bit codes)", "changed_blocks": "blocks above content.blockLevel",
 		"changed": "frame generation only: fraction of 1/4-res luma samples that changed by > fg.repeatChangedLevel codes vs the previous picture", "discontinuity": "loss / repair / decode error before it",
 		"outlier": "pacer: late by a whole interval (missed console frame / stall)",
 		"shown": "real | generated | fallback_repeat | not_shown | skipped",
@@ -190,7 +193,8 @@ final class FrameTrace: @unchecked Sendable {
 				if r.submitted.isFinite && r.decoded.isFinite { put("decode_ms", (r.decoded - r.submitted) * 1000) }
 				put("target", r.target); put("delay_ms", r.delayMs)
 				put("present_at", r.presentAt); put("committed", r.committed); put("presented", r.presented); put("refreshes", r.refreshes)
-				put("changed", r.value)
+				put("changed", r.value); put("block_max", r.blockMax)
+				if r.changedBlocks >= 0 { o["changed_blocks"] = r.changedBlocks }
 				if r.flags.contains(.late) { o["late"] = true }
 				if r.flags.contains(.skip) { o["skip"] = true }
 				if r.flags.contains(.isRepeat) { o["repeat"] = true }

@@ -64,6 +64,8 @@ final class FrameGenerator {
 		var jitter: Double = 0
 		var pacerDelay: Double = 0
 		var traceID = 0
+		/// The renderer's content analysis (new / repeat, histogram); the generator decides from this only.
+		var analysis: ContentAnalysis? = nil
 	}
 
 	var trace: FrameTrace?
@@ -196,6 +198,8 @@ final class FrameGenerator {
 		var index: Int
 		var started = false
 		var presentAt: Double?
+		/// Interpolation phase between prev and next (0.5; 1/3, 2/3 ... within a run of repeats).
+		var phase: Float = 0.5
 		var traceID = 0
 		/// Set when the slot clock had to cap the delay below what interpolation needs.
 		var budget: (need: Double, allowed: Double)?
@@ -272,6 +276,7 @@ final class FrameGenerator {
 			self.method = m
 			self.clock = nil
 			self.extrapolatedFor = nil
+			self.lastPrediction = nil
 			self.extrapolator?.resetHistory()
 			self.publish()
 		}
@@ -315,12 +320,20 @@ final class FrameGenerator {
 		if mode != .off { ensureProcessor(w, h) }
 
 		// 1. Analysis against the previous picture.
-		let (changed, hist) = analyze(input.buffer, previous: lastPicture?.buffer)
-		let isRepeat = lastPicture != nil && changed < repeatFraction && !input.discontinuity
-		trace?.update(input.traceID) { r in
-			r.value = Double(changed)
-			if isRepeat { r.flags.insert(.isRepeat) }
+		let changed: Float, hist: [Float], isRepeat: Bool
+		if let a = input.analysis {
+			changed = a.changedFraction
+			hist = a.hist
+			isRepeat = lastPicture != nil && a.isRepeat && !input.discontinuity
+		} else {
+			(changed, hist) = analyze(input.buffer, previous: lastPicture?.buffer)
+			isRepeat = lastPicture != nil && changed < repeatFraction && !input.discontinuity
+			trace?.update(input.traceID) { r in
+				r.value = Double(changed)
+				if isRepeat { r.flags.insert(.isRepeat) }
+			}
 		}
+		_ = changed
 		var pic = Picture(buffer: input.buffer, buffer8: nil, hist: hist, input: input, index: idx)
 
 		// 2. Cadence.
@@ -348,6 +361,8 @@ final class FrameGenerator {
 			// 30 fps stream): the prediction sat half an interval earlier, the repeat keeps its own slot.
 			if cadence == .fillRepeats && extrapolatedFor != nil && extrapolatedFor == lastNew?.index {
 				trace?.update(input.traceID) { $0.shown = .skipped }
+			} else if cadence == .fillRepeats && extendPrediction(input) {
+				// handled
 			} else {
 				appendReal(input, index: idx)
 				drain()
@@ -362,10 +377,17 @@ final class FrameGenerator {
 			return
 		}
 		if isRepeat {
+			let waiting = slots.filter { $0.isGen && !$0.done && $0.next == nil && !$0.started }
 			let lastSlotWaits = slots.last.map { $0.isGen && !$0.done && $0.next == nil } ?? false
-			if lastSlotWaits, let w = slots.last {
-				// Second repeat in a row (content below 30 fps): a 0.5-phase picture would be wrong for
-				// either slot; show the pictures as they are.
+			if lastSlotWaits, let w = slots.last, cadence == .fillRepeats, generating, let prev = w.prev,
+			   waiting.count + 1 <= Int(t.fgRunMaxRepeats) {
+				// Another repeat in a row (the game dropped below 30 fps): this picture also gets a slot, and
+				// every waiting slot between the same two pictures is re-phased evenly (1/3, 2/3, ...).
+				appendGen(prev: prev, fallback: input, slot: slotIndex(input.grid), index: idx)
+				let run = slots.filter { $0.isGen && !$0.done && $0.next == nil && $0.prev?.index == prev.index }
+				for (j, s) in run.enumerated() { s.phase = Float(j + 1) / Float(run.count + 1) }
+			} else if lastSlotWaits, let w = slots.last {
+				// More repeats than handled: show the pictures as they are.
 				fallBack(w, reason: .runOfRepeats)
 				appendReal(input, index: idx)
 			} else if cadence == .fillRepeats && generating, let prev = lastNew {
@@ -436,6 +458,8 @@ final class FrameGenerator {
 	// MARK: Extrapolation (no added delay)
 
 	private var extrapolatedFor: Int?
+	/// Last prediction: its pair, factor and output (runs of repeats predict further or hold it).
+	private var lastPrediction: (prev: CVPixelBuffer, cur: CVPixelBuffer, curIndex: Int, factor: Float, picture: CVPixelBuffer, runs: Int)?
 
 	/// The real picture is emitted at once at its normal target; the predicted picture follows half a
 	/// content interval later (doubling) or in the next stream slot (fill), if the motion is trustworthy.
@@ -443,6 +467,7 @@ final class FrameGenerator {
 		appendReal(input, index: idx)
 		drain()
 		extrapolatedFor = nil
+		lastPrediction = nil
 		// After the real picture is on its way: motion (also used to tell cuts from fast pans).
 		let motion = lastNew.flatMap { extrapolator?.estimate(prev: $0.buffer, cur: input.buffer) }
 		let isCut = lastNew.map { self.isCut(histDistance: histDistance($0.hist, pic.hist), motion: motion) } ?? true
@@ -490,7 +515,8 @@ final class FrameGenerator {
 			resolveTrace(slotID, outcome: .fallback, reason: .processingTooLate, value: (t0 - (target - commitMargin)) * 1000) { $0.motionMs = m.ms }
 			return
 		}
-		guard let g = ex.warp(cur: input.buffer, prev: prev.buffer, factor: Float(t.exFactorScale * tOut / span)) else {
+		let factor = Float(t.exFactorScale * tOut / span) * extrapolationFactorScale(m)
+		guard let g = ex.warp(cur: input.buffer, prev: prev.buffer, factor: factor) else {
 			fallbacks += 1
 			resolveTrace(slotID, outcome: .fallback, reason: .interpolationFailed)
 			return
@@ -513,6 +539,38 @@ final class FrameGenerator {
 		genWindowCount += 1
 		extrapolated += 1
 		extrapolatedFor = idx
+		lastPrediction = (prev.buffer, input.buffer, idx, factor, g, 0)
+	}
+
+	/// Fill mode, a further repeat after a predicted one (the game dropped below 30 fps): predict further
+	/// ahead along the same motion, up to `ex.maxRunFactor`, else hold the last predicted picture. Never
+	/// re-show the older real picture after the prediction (that steps the motion backwards).
+	private func extendPrediction(_ input: Input) -> Bool {
+		guard t.fgRunMaxRepeats >= 2, var lp = lastPrediction, lp.curIndex == lastNew?.index, lp.runs + 2 <= Int(t.fgRunMaxRepeats) else { return false }
+		lp.runs += 1
+		let slotID = newSlotTrace(method: 2, target: input.target, seq: input.traceID)
+		let f = lp.factor * Float(lp.runs + 1)
+		var pic = lp.picture
+		var reason = TraceReason.generated
+		if f <= Float(t.exMaxRunFactor) + 1e-3, let g = extrapolator?.warp(cur: lp.cur, prev: lp.prev, factor: f) {
+			pic = g
+			lp.picture = g
+		} else {
+			reason = .runOfRepeats  // held: the last prediction stays on screen
+		}
+		lastPrediction = lp
+		if reason == .generated {
+			resolveTrace(slotID, outcome: .generated, reason: .generated, value: Double(f))
+			generated += 1
+			genWindowCount += 1
+		} else {
+			resolveTrace(slotID, outcome: .fallback, reason: .runOfRepeats, value: Double(f), limit: t.exMaxRunFactor)
+			fallbacks += 1
+		}
+		emit?(GeneratedEmit(buffer: pic, arrival: input.arrival, target: input.target, interval: input.interval, kind: reason == .generated ? .generated : .fallbackRepeat,
+		                    sourceIndex: lp.curIndex, traceID: slotID))
+		trace?.update(input.traceID) { $0.shown = .skipped }
+		return true
 	}
 
 	// MARK: Slot clock
@@ -553,7 +611,27 @@ final class FrameGenerator {
 
 	/// Keeps the clock: created on entering generation, moved only in whole output slots — later at once
 	/// when a real picture would miss its slot, earlier after 6 s with more than a slot of spare time.
+	private var lastLaterShift = 0.0, lastGenMissShift = 0.0
+
+	/// A generated slot missed its deadline: give the next ones a slot more, within the latency budget.
+	private func shiftLaterAfterGenMiss() {
+		guard t.fgMissShiftsLater >= 0.5, var c = clock else { return }
+		let now = CACurrentMediaTime()
+		guard now - lastGenMissShift > 2 * c.slotDur else { return }
+		guard addedLatency + c.slotDur <= maxAddedLatency + c.slotDur * 0.5 else { return }
+		c.anchorDisplay += c.slotDur
+		c.missed = true
+		c.windowStart = now
+		c.minSlack = .infinity
+		clock = c
+		slotShifts += 1
+		lastGenMissShift = now
+		lastLaterShift = now
+		trace?.event(.slotShiftLater, value: 1, limit: -1)
+	}
+
 	private func updateClock(_ i: Input) {
+		var shiftedLaterNow = false
 		let now = CACurrentMediaTime()
 		let periodOut = cadence == .doubling ? i.interval / 2 : i.interval
 		let v = vsyncInfo(fallbackRefresh: clock?.refresh ?? (1.0 / 120))
@@ -574,6 +652,8 @@ final class FrameGenerator {
 			// grid. The pacer re-bases its grid when the console's timeline really slipped.
 			lateReal += 1
 		} else if slack < 0 {
+			shiftedLaterNow = true
+			lastLaterShift = now
 			// This real picture would miss its slot: move the whole grid later by whole slots.
 			let n = (-slack / c.slotDur).rounded(.up)
 			c.anchorDisplay += n * c.slotDur
@@ -589,8 +669,11 @@ final class FrameGenerator {
 		// Latency over budget, or comfortable for 3 s: one slot earlier.
 		let delay = c.anchorDisplay + Double(o) * c.slotDur - i.grid
 		let overBudget = delay - i.pacerDelay > maxAddedLatency + c.slotDur * 0.5
-		if now - c.windowStart > t.fgShiftEarlierSeconds || overBudget {
-			if overBudget || (!c.missed && c.minSlack > c.slotDur + 0.002) {
+		// Over budget pulls the clock earlier, but never undoes a shift-later of this frame or of the last
+		// `fgShiftEarlierSeconds` (that ping-pong left every generated slot short of time).
+		let mayPull = !shiftedLaterNow && now - lastLaterShift > t.fgShiftEarlierSeconds
+		if now - c.windowStart > t.fgShiftEarlierSeconds || (overBudget && mayPull) {
+			if (overBudget && mayPull) || (!c.missed && c.minSlack > c.slotDur + 0.002) {
 				c.anchorDisplay -= c.slotDur
 				slotShifts += 1
 				trace?.event(.slotShiftEarlier, value: overBudget ? 1 : 0, limit: (delay - i.pacerDelay) * 1000, seq: i.traceID)
@@ -645,6 +728,7 @@ final class FrameGenerator {
 			self.noteGenSlack(-1)
 			// Stage it was stuck in: 0 waiting for the next real picture, 1 interpolating, 2 queued behind another.
 			let stage: Double = slot.next == nil ? 0 : (slot.started ? 1 : 2)
+			self.shiftLaterAfterGenMiss()
 			if let b = slot.budget {
 				self.fallBack(slot, reason: .budgetExceeded, value: b.need * 1000, limit: b.allowed * 1000)
 			} else {
@@ -680,12 +764,22 @@ final class FrameGenerator {
 	}
 
 	private func kickInterpolation() {
-		guard !interpolating,
-		      let slot = slots.first(where: { $0.isGen && !$0.done && !$0.started && $0.next != nil }),
-		      let prev = slot.prev?.buffer8, let next = slot.next?.buffer8
-		else { return }
-		slot.started = true
-		interpolate(prev: prev, cur: next, slot: slot)
+		while !interpolating, let slot = slots.first(where: { $0.isGen && !$0.done && !$0.started && $0.next != nil }) {
+			// Queued behind another and already hopeless: give its slot to the fallback now, not at the deadline.
+			if t.fgDropHopeless >= 0.5, procTimes.count > 4 {
+				let p50 = procTimes.percentile(0.5, scratch: &procScratch)
+				let late = CACurrentMediaTime() + p50 - (slot.target - commitMargin)
+				if late > 0 {
+					fallBack(slot, reason: .deadlineMissed, value: late * 1000, limit: 2)
+					drain()
+					continue
+				}
+			}
+			guard let prev = slot.prev?.buffer8, let next = slot.next?.buffer8 else { return }
+			slot.started = true
+			interpolate(prev: prev, cur: next, slot: slot)
+			return
+		}
 	}
 
 	// MARK: Cadence
@@ -860,6 +954,23 @@ final class FrameGenerator {
 		return o
 	}
 
+	/// The low-latency interpolator writes damaged bottom rows when the height is not a multiple of 16
+	/// (1080): measured on the real capture, the last 4 rows had 2.8x the error of the rows above. Copy
+	/// them (4 luma, 2 chroma rows) from the temporally nearer source picture. Same 8-bit format.
+	static func repairBottomRows(_ dst: CVPixelBuffer, from src: CVPixelBuffer) {
+		guard CVPixelBufferGetHeight(dst) % 16 != 0, CVPixelBufferGetPixelFormatType(dst) == CVPixelBufferGetPixelFormatType(src),
+		      CVPixelBufferGetWidth(dst) == CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(dst) == CVPixelBufferGetHeight(src) else { return }
+		CVPixelBufferLockBaseAddress(dst, []); CVPixelBufferLockBaseAddress(src, .readOnly)
+		defer { CVPixelBufferUnlockBaseAddress(src, .readOnly); CVPixelBufferUnlockBaseAddress(dst, []) }
+		for (plane, rows) in [(0, 4), (1, 2)] where plane < CVPixelBufferGetPlaneCount(dst) {
+			guard let d = CVPixelBufferGetBaseAddressOfPlane(dst, plane), let s = CVPixelBufferGetBaseAddressOfPlane(src, plane) else { continue }
+			let h = CVPixelBufferGetHeightOfPlane(dst, plane)
+			let db = CVPixelBufferGetBytesPerRowOfPlane(dst, plane), sb = CVPixelBufferGetBytesPerRowOfPlane(src, plane)
+			let n = min(db, sb)
+			for j in max(0, h - rows)..<h { memcpy(d + j * db, s + j * sb, n) }
+		}
+	}
+
 	private func ensureProcessor(_ w: Int, _ h: Int) {
 		if processor != nil && processorSize == (w, h) { return }
 		guard !settingUp else { return }
@@ -891,6 +1002,36 @@ final class FrameGenerator {
 				return pl
 			}
 			let p8 = pool(cfg.sourcePixelBufferAttributes), po = pool(cfg.destinationPixelBufferAttributes)
+			// Warm-up: the first calls are several times slower (model load / caches). Run a few on grey
+			// pictures here, off the frame path, so live slots never pay for them.
+			var warm: [Double] = []
+			if let p8, let po {
+				func grey() -> CVPixelBuffer? {
+					var b: CVPixelBuffer?
+					guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, p8, &b) == kCVReturnSuccess, let b else { return nil }
+					CVPixelBufferLockBaseAddress(b, [])
+					for pl in 0..<CVPixelBufferGetPlaneCount(b) {
+						memset(CVPixelBufferGetBaseAddressOfPlane(b, pl), pl == 0 ? 0x80 : 0x80, CVPixelBufferGetBytesPerRowOfPlane(b, pl) * CVPixelBufferGetHeightOfPlane(b, pl))
+					}
+					CVPixelBufferUnlockBaseAddress(b, [])
+					return b
+				}
+				for i in 0..<4 {
+					var o: CVPixelBuffer?
+					guard let a = grey(), let c = grey(), CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, po, &o) == kCVReturnSuccess, let o,
+					      let fa = VTFrameProcessorFrame(buffer: a, presentationTimeStamp: CMTime(value: CMTimeValue(4 * i), timescale: 120)),
+					      let fc = VTFrameProcessorFrame(buffer: c, presentationTimeStamp: CMTime(value: CMTimeValue(4 * i + 2), timescale: 120)),
+					      let fo = VTFrameProcessorFrame(buffer: o, presentationTimeStamp: CMTime(value: CMTimeValue(4 * i + 1), timescale: 120)),
+					      let prm = VTLowLatencyFrameInterpolationParameters(sourceFrame: fc, previousFrame: fa, interpolationPhase: [0.5], destinationFrames: [fo])
+					else { break }
+					let sem = DispatchSemaphore(value: 0)
+					let t0 = CACurrentMediaTime()
+					p.process(parameters: prm) { _, _ in sem.signal() }
+					if sem.wait(timeout: .now() + 2) == .timedOut { break }
+					warm.append((CACurrentMediaTime() - t0) * 1000)
+				}
+			}
+			NSLog("[PSVideo] frame interpolation warm-up calls (ms): %@", warm.map { String(format: "%.1f", $0) }.joined(separator: ", "))
 			self?.queue.async {
 				guard let self else { return }
 				self.settingUp = false
@@ -912,7 +1053,7 @@ final class FrameGenerator {
 		      let fPrev = VTFrameProcessorFrame(buffer: prev, presentationTimeStamp: CMTime(value: CMTimeValue(2 * t), timescale: 120)),
 		      let fCur = VTFrameProcessorFrame(buffer: cur, presentationTimeStamp: CMTime(value: CMTimeValue(2 * t + 2), timescale: 120)),
 		      let fDst = VTFrameProcessorFrame(buffer: d, presentationTimeStamp: CMTime(value: CMTimeValue(2 * t + 1), timescale: 120)),
-		      let params = VTLowLatencyFrameInterpolationParameters(sourceFrame: fCur, previousFrame: fPrev, interpolationPhase: [0.5], destinationFrames: [fDst])
+		      let params = VTLowLatencyFrameInterpolationParameters(sourceFrame: fCur, previousFrame: fPrev, interpolationPhase: [slot.phase], destinationFrames: [fDst])
 		else { fallBack(slot, reason: .interpolationFailed); drain(); return }
 		CVBufferPropagateAttachments(cur, d)
 		interpolating = true
@@ -935,6 +1076,7 @@ final class FrameGenerator {
 						NSLog("[PSVideo] frame interpolation failed: %@", "\(error)")
 						self.fallBack(slot, reason: .interpolationFailed)
 					} else {
+						Self.repairBottomRows(d, from: slot.phase < 0.5 ? prev : cur)
 						let out = self.protectStatic(prev: prev, next: cur, interp: d)
 						slot.emit = GeneratedEmit(buffer: out, arrival: slot.next?.input.arrival ?? 0, target: slot.target,
 						                          interval: slot.interval, kind: .generated, sourceIndex: slot.index, presentAt: slot.presentAt, traceID: slot.traceID)
@@ -1016,7 +1158,10 @@ final class FrameGenerator {
 			var ok = false
 			proc.process(parameters: params) { _, e in ok = e == nil; sem.signal() }
 			sem.wait()
-			if ok { result = (protectStatic(prev: p8, next: n8, interp: d), (CACurrentMediaTime() - t0) * 1000) }
+			if ok {
+				Self.repairBottomRows(d, from: n8)
+				result = (protectStatic(prev: p8, next: n8, interp: d), (CACurrentMediaTime() - t0) * 1000)
+			}
 		}
 		return result
 	}
@@ -1083,8 +1228,25 @@ final class FrameGenerator {
 	/// Extrapolation is allowed only when the motion is trustworthy: motion explains the change
 	/// (residual), and the field did not change much since the last interval (otherwise the prediction
 	/// overshoots where motion stops or reverses).
+	/// Algorithm 2: how much of the prediction distance to use. Motion that changed between the last two
+	/// intervals is where extrapolation overshoots: predict a shorter distance instead of rejecting the slot.
+	func extrapolationFactorScale(_ m: MotionExtrapolator.Motion) -> Float {
+		let t = self.t
+		guard t.exAlgorithm >= 1.5, m.hasPreviousField else { return 1 }
+		let limit = max(Float(t.exFieldChangeAbsPx), Float(t.exFieldChangeRel) * m.meanMotion)
+		guard m.fieldChange > limit else { return 1 }
+		return max(Float(t.exMinFactorScale), limit / m.fieldChange)
+	}
+
 	func extrapolationAllowed(_ m: MotionExtrapolator.Motion) -> (Bool, String) {
 		let t = self.t
+		if t.exAlgorithm >= 1.5 {
+			// Per-pixel confidence handles poor matches; only a picture motion explains almost nothing of is rejected.
+			// (A nearly static picture has a meaningless ratio; it is generated, and comes out ~unchanged.)
+			if m.residualRatio > Float(t.exV2MaxResidual) && m.meanMotion > Float(t.exFieldChangeAbsPx) { return (false, "low confidence") }
+			if !m.hasPreviousField { return (false, "no motion history") }
+			return (true, "ok")
+		}
 		if m.residualRatio > Float(t.exMaxResidual) { return (false, "low confidence") }
 		if !m.hasPreviousField { return (false, "no motion history") }
 		if m.fieldChange > max(Float(t.exFieldChangeAbsPx), Float(t.exFieldChangeRel) * m.meanMotion) { return (false, "motion changing") }
@@ -1108,7 +1270,7 @@ final class FrameGenerator {
 			guard let ex = extrapolator, let m = ex.estimate(prev: prev, cur: cur) else { return (nil, "unavailable", nil, 0) }
 			let (ok, why) = extrapolationAllowed(m)
 			guard ok || force else { return (nil, why, m, (CACurrentMediaTime() - t0) * 1000) }
-			let pic = ex.warp(cur: cur, prev: prev, factor: factor)
+			let pic = ex.warp(cur: cur, prev: prev, factor: factor * extrapolationFactorScale(m))
 			return (pic, ok ? "ok" : "forced (\(why))", m, (CACurrentMediaTime() - t0) * 1000)
 		}
 	}

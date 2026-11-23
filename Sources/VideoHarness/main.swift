@@ -63,6 +63,10 @@ struct Options {
 	var captureFile: String?
 	var bunch = 0.0
 	var streamInfo: String?
+	var holdout = 0
+	var holdoutDump: String?
+	var holdoutCSV: String?
+	var holdoutMethods = "extrapolate,interpolate"
 	var stripVUI = false
 	var steady = false
 	var makeCapture: String?
@@ -135,6 +139,10 @@ while !args.isEmpty {
 	case "--steady": opt.steady = true
 	case "--bunch": opt.bunch = Double(next()) ?? 0
 	case "--stream-info": opt.streamInfo = next()
+	case "--holdout": opt.holdout = Int(next()) ?? 200
+	case "--holdout-dump": opt.holdoutDump = next()
+	case "--holdout-csv": opt.holdoutCSV = next()
+	case "--holdout-methods": opt.holdoutMethods = next()
 	case "--strip-vui": opt.stripVUI = true
 	case "--make-capture": opt.makeCapture = next()
 	case "--trace": opt.traceOut = next()
@@ -388,6 +396,7 @@ if let out = opt.makeCapture {
 	exit(0)
 }
 
+var holdoutRunner: HoldoutRunner?
 /// Replay source: a PSCAP1 file (header record first, then frames with their recorded arrival times).
 var replay: (header: StreamCaptureHeader, records: [StreamCaptureRecord])?
 if let f = opt.captureFile {
@@ -412,6 +421,10 @@ let app = NSApplication.shared
 app.setActivationPolicy(opt.window ? .accessory : .prohibited)
 
 let pipeline = VideoPipeline(displayMode: opt.mode, pacingMode: opt.pacing)
+if opt.holdout > 0 {
+	holdoutRunner = HoldoutRunner(pipeline: pipeline, maxPairs: opt.holdout, dumpDir: opt.holdoutDump, csv: opt.holdoutCSV,
+	                              methods: Set(opt.holdoutMethods.split(separator: ",").map(String.init)))
+}
 if let v = opt.minDelayMs { pipeline.minimumPlayoutDelayMs = v }
 if let v = opt.maxDelayMs { pipeline.maximumPlayoutDelayMs = v }
 pipeline.upscaler = opt.upscaler
@@ -603,6 +616,18 @@ let feeder = Thread {
 		let interval = 1.0 / Double(max(1, rp.header.profile.fps))
 		var buf = [UInt8](repeating: 0, count: 1 << 22)
 		for (i, r) in rp.records.enumerated() {
+			if let h = holdoutRunner {
+				// Offline: as fast as the hold-out analysis keeps up.
+				while h.pending > 2 && !h.done { usleep(500) }
+				if h.done { break }
+				if buf.count < r.data.count + 64 { buf = [UInt8](repeating: 0, count: r.data.count + 64) }
+				_ = buf.withUnsafeMutableBytes { b -> Bool in
+					r.data.copyBytes(to: b.bindMemory(to: UInt8.self).baseAddress!, count: r.data.count)
+					memset(b.baseAddress! + r.data.count, 0, 64)
+					return pipeline.videoStreamDidReceive(accessUnit: UnsafeRawBufferPointer(start: b.baseAddress!, count: r.data.count), framesLost: r.framesLost, frameRecovered: r.frameRecovered)
+				}
+				continue
+			}
 			let t = opt.steady ? (i == 0 ? 0 : 0.005 + Double(i - 1) * interval) : Double(r.arrivalNanoseconds) / 1e9
 			if t > opt.seconds + 0.01 && opt.seconds > 0 { break }
 			let due = start + UInt64(t * 1e9 * Double(tb.denom) / Double(tb.numer))
@@ -1013,6 +1038,7 @@ if opt.overlay {
 	}
 	RunLoop.main.add(t, forMode: .common)
 }
+if let h = holdoutRunner { pipeline.setDecodedFrameObserver { h.decoded($0) } }
 feeder.start()
 var lastPrint = CACurrentMediaTime()
 var shotTaken = false
@@ -1075,6 +1101,10 @@ if let tr = opt.traceOut {
 		let n = try pipeline.writeFrameTrace(to: URL(fileURLWithPath: tr), lastSeconds: 3600)
 		log("trace: \(n) records -> \(tr)")
 	} catch { log("trace write failed: \(error)") }
+}
+if let h = holdoutRunner {
+	while h.pending > 0 { Thread.sleep(forTimeInterval: 0.05) }
+	log(h.report())
 }
 summarizePresentation()
 summarizeSchedule()

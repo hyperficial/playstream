@@ -121,6 +121,7 @@ final class StreamController: ObservableObject {
 
 		input.hapticsToRumbleEnabled = settings.hapticsAsRumble && configuration.enableDualSense
 
+		applyTunableOverrides()
 		try session.start()
 
 		// Controller snapshots go to the session through the activity monitor, which only looks.
@@ -331,6 +332,21 @@ final class StreamController: ObservableObject {
 	}
 
 	private var statsTick = 0
+
+	/// Internal pipeline values that have been tuned on this machine and should survive a
+	/// reconnect or restart. Stored as a name-to-number dictionary under `debug.tunableOverrides`
+	/// (set with `defaults write dev.playstream.PlayStream debug.tunableOverrides -dict ...`).
+	private func applyTunableOverrides() {
+		guard let overrides = UserDefaults.standard.dictionary(forKey: "debug.tunableOverrides"), !overrides.isEmpty,
+		      let debug = (video as AnyObject) as? VideoDebugControlling else { return }
+		var applied: [String] = []
+		var refused: [String] = []
+		for (name, value) in overrides.sorted(by: { $0.key < $1.key }) {
+			guard let number = (value as? NSNumber)?.doubleValue else { refused.append(name); continue }
+			if debug.setDebugTunable(name, to: number) { applied.append("\(name)=\(number)") } else { refused.append(name) }
+		}
+		CoreLog.note("Tunable overrides applied: \(applied.joined(separator: ", "))" + (refused.isEmpty ? "" : " | refused: \(refused.joined(separator: ", "))"))
+	}
 
 	/// True while the stats overlay is composited into the video frame by the pipeline.
 	@Published private(set) var drawsOverlayInFrame = false

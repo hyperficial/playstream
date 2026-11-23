@@ -385,7 +385,7 @@ public final class VideoPipeline: VideoStreamSink {
 		let a = pacer.arrivalStats()
 		let paced = mode == .adaptive
 		let delay = pacer.delay, target = pacer.targetDelay, fps = 1 / pacer.interval
-		let late = lateFrames, skipped = skippedFrames, rebases = pacer.rebases
+		let late = lateFrames, skipped = skippedFrames, rebases = pacer.rebases, bunches = pacer.bunches
 		collector.update { s in
 			s.pacingMode = mode
 			s.streamFPS = fps
@@ -397,6 +397,7 @@ public final class VideoPipeline: VideoStreamSink {
 			s.framesLate = late
 			s.framesSkipped = skipped
 			s.pacerRebases = rebases
+			s.pacerBunches = bunches
 		}
 	}
 
@@ -646,6 +647,15 @@ public final class VideoPipeline: VideoStreamSink {
 	}
 
 	/// Diagnostics: frame generation's picture analysis (changed-pixel fraction, luma histogram).
+	private lazy var offscreenContent: ContentAnalyzer? = MTLCreateSystemDefaultDevice().flatMap { ContentAnalyzer(device: $0) }
+
+	/// Diagnostics: the content analysis (new / repeat) of `pb` against `previous`, with the current tunables.
+	@_spi(Diagnostics)
+	public func contentAnalysisOffscreen(_ pb: CVPixelBuffer, previous: CVPixelBuffer?) -> (isRepeat: Bool, maxBlockMean: Float, changedBlocks: Int)? {
+		guard let a = offscreenContent?.analyze(pb, previous: previous, t: tunables.values) else { return nil }
+		return (a.isRepeat, a.maxBlockMean, a.changedBlocks)
+	}
+
 	@_spi(Diagnostics)
 	public func analyzeOffscreen(_ pb: CVPixelBuffer, previous: CVPixelBuffer?) -> (changed: Float, hist: [Float])? {
 		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.analyzeNow(pb, previous: previous)
