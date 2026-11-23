@@ -32,6 +32,15 @@ targets:
     entitlements:
       path: App/PlayStream.entitlements
       properties: {}
+    postBuildScripts:
+      # Git commit and build time into the built Info.plist (psctl status shows them). The
+      # input file orders the script after Info.plist processing; signing comes after it.
+      - name: Stamp build identity
+        script: |
+          "${SRCROOT}/scripts/stamp-build.sh"
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
+        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.playstream.PlayStream

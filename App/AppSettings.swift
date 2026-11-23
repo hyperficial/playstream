@@ -3,6 +3,10 @@ import PSContracts
 import SwiftUI
 
 /// User-facing stream settings, persisted in UserDefaults.
+///
+/// Every key here is also listed in `SettingsCatalog` (PSCore) with its type, range and default,
+/// which is what lets `psctl settings set` change it from the terminal. When adding a setting,
+/// add it there too; `ps-core-harness selftest` fails if the two lists disagree.
 final class AppSettings: ObservableObject {
 	enum Resolution: Int, CaseIterable, Identifiable {
 		case p1080 = 1080
@@ -53,6 +57,12 @@ final class AppSettings: ObservableObject {
 	@AppStorage("stream.framePacing") var framePacing: Bool = true
 	@AppStorage("audio.volume") var volume: Double = 1.0
 	@AppStorage("stream.startFullscreen") var startFullscreen: Bool = true
+	/// The local control socket `scripts/psctl` talks to (same user only). Applies live.
+	@AppStorage("debug.controlChannel") var controlChannel: Bool = true
+	/// Write a `Hitch:` line into the log when a visible hitch is detected. Applies live.
+	@AppStorage("debug.hitchNotes") var hitchNotes: Bool = true
+	/// At launch, reconnect to the console that was streaming when the app last quit or was relaunched.
+	@AppStorage("resume.autoReconnect") var autoReconnect: Bool = true
 
 	static let bitrateRange: ClosedRange<Double> = 2...100
 
