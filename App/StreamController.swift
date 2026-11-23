@@ -27,6 +27,16 @@ final class StreamController: ObservableObject {
 	let video: VideoPipeline
 	let audio: AudioPipeline
 	let recorder = StreamRecorder()
+	/// Flight recorder: sits between the session and the video pipeline and keeps the last
+	/// seconds of the encoded stream for `psctl capture`.
+	let captureTee = StreamCaptureTee()
+	/// Sees the controller snapshots on their way to the session, to know when the player pauses.
+	let inputActivity = ControllerActivityMonitor()
+	let startedAt = Date()
+	/// When the stream came up (nil while connecting).
+	private(set) var streamingSince: Date?
+	/// The session reached the streaming phase at some point.
+	var everStreamed: Bool { streamingSince != nil }
 
 	@Published private(set) var phase: Phase = .connecting
 	@Published private(set) var liveStats = LiveStats()
@@ -45,12 +55,15 @@ final class StreamController: ObservableObject {
 
 	/// Called once, on the main thread, when the session is over.
 	var onEnded: ((_ reason: String, _ isError: Bool) -> Void)?
+	/// Called on the main thread when the stream is up.
+	var onStreaming: (() -> Void)?
 
 	private let session: StreamSession
 	private let input: ControllerInput
 	private let settings: AppSettings
 	private var statsTimer: Timer?
 	private var activity: NSObjectProtocol?
+	private var hitches = HitchDetector()
 
 	init(configuration: SessionConfiguration, settings: AppSettings, input: ControllerInput) {
 		self.configuration = configuration
@@ -81,11 +94,24 @@ final class StreamController: ObservableObject {
 			recorder.options.fallbackColorTags = .hdr10
 		}
 
+		// The video stream passes through the flight recorder on its way to the pipeline. The
+		// recorder hands every buffer on first and copies it afterwards (see StreamCaptureTee).
+		captureTee.downstream = video
+		captureTee.keyframeRequester = session
+		captureTee.logHandler = { CoreLog.note($0) }
+		let build = BuildInfo.summary
+		let console = configuration.host.nickname
+		captureTee.notesProvider = {
+			// Runs on the capture queue: only thread-safe sources.
+			["settings": SettingsCatalog.snapshot(.standard), "build": build, "console": console]
+		}
+		applyDebugSettings()
+
 		// Deliberately not wiring session.onVideoLoss to recorder.noteVideoLoss(): the core only
 		// delivers frames whose references we hold, so the recorded bitstream stays decodable
 		// after a loss, and forcing a keyframe on every lost frame would spike the bitrate on
 		// exactly the links that are already struggling.
-		session.videoSink = video
+		session.videoSink = captureTee
 		session.audioSink = audio
 		session.hapticsSink = input
 		session.feedbackSink = input
@@ -97,7 +123,9 @@ final class StreamController: ObservableObject {
 
 		try session.start()
 
-		input.receiver = session
+		// Controller snapshots go to the session through the activity monitor, which only looks.
+		inputActivity.downstream = session
+		input.receiver = inputActivity
 		// Keep the display awake and tell the scheduler this is latency-sensitive work.
 		activity = ProcessInfo.processInfo.beginActivity(
 			options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled, .userInitiated, .latencyCritical],
@@ -105,6 +133,9 @@ final class StreamController: ObservableObject {
 		)
 		statsTimer = Timer.scheduledTimer(withTimeInterval: Self.statsInterval, repeats: true) { [weak self] _ in
 			MainActor.assumeIsolated { self?.refreshStats() }
+		}
+		if captureTee.keyframeIntervalSeconds > 0 {
+			CoreLog.note("Flight recorder: requesting a keyframe every \(Int(captureTee.keyframeIntervalSeconds)) s (debug.flightRecorderKeyframeSeconds); set it to 0 to stop")
 		}
 		CoreLog.note("Session started: \(configuration.profile.width)x\(configuration.profile.height)@\(configuration.profile.fps) \(configuration.profile.codec) \(configuration.profile.bitrateKbps) kbit/s, renderer \(video.displayMode.rawValue), start bitrate hint \(configuration.startBitrateHint)")
 	}
@@ -124,8 +155,11 @@ final class StreamController: ObservableObject {
 		return (needsMetal ? .metal : .sampleBufferLayer, pacing, upscaler, frameGeneration)
 	}
 
-	/// Settings that can change in the middle of a session.
-	func applyLiveSettings() {
+	/// Settings that can change in the middle of a session. Returns what was changed, in words
+	/// (empty when everything already matched), so a caller can report it.
+	@discardableResult
+	func applyLiveSettings() -> [String] {
+		guard phase != .ended else { return [] }
 		let wanted = Self.videoConfiguration(for: settings)
 		var changes: [String] = []
 		if video.displayMode != wanted.display {
@@ -158,6 +192,117 @@ final class StreamController: ObservableObject {
 			changes.append("frame generation budget \(Int(settings.frameGenerationMaxDelay)) ms")
 		}
 		if !changes.isEmpty { CoreLog.note("Video settings changed: " + changes.joined(separator: ", ")) }
+
+		// The volume slider in the stream view sets the pipeline directly; a value written to
+		// the setting from elsewhere (the control channel) is picked up here.
+		let wantedVolume = Float(min(max(settings.volume, 0), 1))
+		if abs(audio.volume - wantedVolume) > 0.001 {
+			audio.volume = wantedVolume
+			changes.append(String(format: "volume %.2f", wantedVolume))
+		}
+		changes += applyDebugSettings()
+		return changes
+	}
+
+	/// Flight recorder limits and hitch-note threshold, from the settings. Returns what changed.
+	@discardableResult
+	private func applyDebugSettings() -> [String] {
+		let defaults = UserDefaults.standard
+		var changes: [String] = []
+		let megabytes = SettingsCatalog.int("debug.flightRecorderMegabytes", in: defaults)
+		let limits = StreamCaptureTee.Limits(seconds: SettingsCatalog.double("debug.flightRecorderSeconds", in: defaults), bytes: megabytes * 1024 * 1024)
+		if captureTee.limits != limits {
+			captureTee.limits = limits
+			changes.append(limits.seconds > 0 ? "flight recorder \(Int(limits.seconds)) s / \(megabytes) MiB" : "flight recorder off")
+		}
+		let keyframeInterval = SettingsCatalog.double("debug.flightRecorderKeyframeSeconds", in: defaults)
+		if abs(captureTee.keyframeIntervalSeconds - (keyframeInterval > 0 ? max(0.5, keyframeInterval) : 0)) > 0.001 {
+			captureTee.keyframeIntervalSeconds = keyframeInterval
+			changes.append(keyframeInterval > 0 ? "flight recorder keyframe every \(Int(keyframeInterval)) s" : "flight recorder keyframe requests off")
+		}
+		hitches.configuration.longFrameFactor = SettingsCatalog.double("debug.hitchFrameFactor", in: defaults)
+		return changes
+	}
+
+	// MARK: Debugging (control channel)
+
+	/// The pipeline's debug interface, once the pipeline offers it.
+	var videoDebug: VideoDebugControlling? { (video as AnyObject) as? VideoDebugControlling }
+
+	/// Session part of `psctl status`.
+	var statusJSON: [String: Any] {
+		let phaseName: String
+		switch phase {
+		case .connecting: phaseName = "connecting"
+		case .streaming: phaseName = "streaming"
+		case .ended: phaseName = "ended"
+		}
+		var profile = JSONValue.reflect(configuration.profile) as? [String: Any] ?? [:]
+		profile["codecName"] = "\(configuration.profile.codec)"
+		return [
+			"running": phase != .ended,
+			"phase": phaseName,
+			"console": ["name": consoleName, "id": configuration.host.id, "address": configuration.address, "isPS5": configuration.host.isPS5] as [String: Any],
+			"profile": profile,
+			"renderer": video.displayMode.rawValue,
+			"pacing": video.pacingMode.rawValue,
+			"upscaler": video.upscaler.rawValue,
+			"frameGeneration": video.frameGeneration.rawValue,
+			"dualSense": configuration.enableDualSense,
+			"startBitrateHint": "\(configuration.startBitrateHint)",
+			"uptimeSeconds": (Date().timeIntervalSince(startedAt) * 10).rounded() / 10,
+			"streamingSeconds": streamingSince.map { (Date().timeIntervalSince($0) * 10).rounded() / 10 } ?? NSNull(),
+			"cantDisplay": cantDisplay,
+			"waitingForPIN": pinRequest != nil,
+			"recording": recorder.isRecording,
+			"videoDebugControl": videoDebug != nil,
+		]
+	}
+
+	/// Everything we measure, for `psctl stats`. Read fresh, not from the last quarter-second poll.
+	var statsJSON: [String: Any] {
+		[
+			"video": JSONValue.reflect(video.stats),
+			"audio": JSONValue.reflect(audio.stats),
+			"session": JSONValue.reflect(session.stats()),
+			"recorder": recorderJSON,
+			"flightRecorder": captureTee.status,
+			"input": [
+				"idleSeconds": (inputActivity.idleSeconds * 100).rounded() / 100,
+				"snapshots": inputActivity.snapshotCount,
+				"controller": input.activeController?.name ?? NSNull(),
+			] as [String: Any],
+			"hitchNotes": hitches.notesWritten,
+		]
+	}
+
+	var recorderJSON: [String: Any] {
+		[
+			"state": "\(recorder.state)",
+			"elapsedSeconds": recorder.elapsed,
+			"bytesWritten": recorder.bytesWritten,
+			"file": recorder.outputURL?.path ?? NSNull(),
+			"finishedFiles": recorder.finishedURLs.map(\.path),
+			"stats": JSONValue.reflect(recorder.stats),
+		]
+	}
+
+	/// `psctl record start|stop|status`.
+	func record(_ action: String) async throws -> [String: Any] {
+		switch action {
+		case "start":
+			guard phase == .streaming else { throw ControlError("the stream is not up yet") }
+			guard recorder.start() else { throw ControlError("a recording is already running") }
+			CoreLog.note("Recording started via control channel")
+			return ["state": "starting", "directory": recorder.options.directory.path, "note": "the file begins at the next keyframe (one was requested)"]
+		case "stop":
+			guard recorder.isRecording else { throw ControlError("no recording is running") }
+			let files = await recorder.stop()
+			CoreLog.note("Recording stopped via control channel: \(files.map(\.lastPathComponent).joined(separator: ", "))")
+			return ["state": "idle", "files": files.map(\.path)]
+		default:
+			return recorderJSON
+		}
 	}
 
 	func submitPIN(_ pin: String) {
@@ -210,6 +355,8 @@ final class StreamController: ObservableObject {
 		))
 		if history.count > Self.historyLength { history.removeFirst(history.count - Self.historyLength) }
 
+		noteHitches(stats, outputFPS: outputFPS)
+
 		// Every 5 s leave a line in the log, so stutter reports can be diagnosed after the fact.
 		statsTick += 1
 		guard statsTick % Int(5 / Self.statsInterval) == 0, phase == .streaming else { return }
@@ -245,10 +392,41 @@ final class StreamController: ObservableObject {
 		))
 	}
 
+	/// Writes a `Hitch:` line when the stats show something the player will have seen or heard:
+	/// a picture held far too long, a burst of late frames, an audio underrun, a gap in the
+	/// network arrivals, lost or dropped frames. Rate-limited inside the detector.
+	private func noteHitches(_ stats: LiveStats, outputFPS: Double) {
+		let v = stats.video
+		var sample = HitchSample(time: ProcessInfo.processInfo.systemUptime)
+		sample.streaming = phase == .streaming
+		sample.framesReceived = v.framesReceived
+		sample.framesLostInNetwork = v.framesLostInNetwork
+		sample.framesDropped = v.framesDropped
+		// Presents one refresh late are routine on some paths; two or more are what shows.
+		sample.framesLate = v.framesLate + v.presentsLate2Plus
+		sample.framesSkipped = v.framesSkipped
+		sample.decodeErrors = v.decodeErrors
+		sample.gridShifts = v.frameGenerationSlotShifts + v.pacerRebases
+		sample.audioUnderruns = stats.audio?.underruns
+		sample.presentedIntervalsMs = v.recentPresentedIntervalsMs
+		sample.arrivalIntervalsMs = v.recentArrivalIntervalsMs
+		sample.presentedFPS = outputFPS
+		sample.streamFPS = v.streamFPS > 1 ? v.streamFPS : Double(configuration.profile.fps)
+		sample.bitrateMbps = stats.session.measuredBitrate / 1_000_000
+		sample.packetLossPercent = stats.session.packetLoss * 100
+		sample.rttMs = stats.session.rttMilliseconds
+		sample.audioBufferedMs = stats.audio?.bufferedMs
+		sample.playoutDelayMs = v.pacingMode == .off ? nil : v.playoutDelayMs
+		guard let line = hitches.ingest(sample), settings.hitchNotes else { return }
+		CoreLog.note(line)
+	}
+
 	private func handle(_ event: SessionEvent) {
 		switch event {
 		case .connected:
 			phase = .streaming
+			streamingSince = Date()
+			onStreaming?()
 		case .loginPINRequested(let incorrect):
 			pinRequest = PINRequest(incorrect: incorrect)
 		case .nicknameReceived(let name):
@@ -263,6 +441,7 @@ final class StreamController: ObservableObject {
 			statsTimer?.invalidate()
 			statsTimer = nil
 			input.receiver = nil
+			inputActivity.downstream = nil
 			input.silenceFeedback()
 			recorder.sessionDidEnd()
 			if let activity { ProcessInfo.processInfo.endActivity(activity) }

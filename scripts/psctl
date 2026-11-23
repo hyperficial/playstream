@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""psctl: inspect, tune and capture a running PlayStream from the terminal.
+
+Talks to the app's local control socket (one JSON request, one JSON response per
+connection). Nothing here opens a window or takes focus; the owner keeps playing.
+
+usage: psctl [--socket PATH] [--timeout SECONDS] [--json] <command> [arguments] [--option value]
+
+  status [path ...]            which build is running, session phase, console, profile, renderer, uptime
+  stats [path ...]             complete stats snapshot (video, audio, session, recorder, flight recorder);
+                               with paths only those parts, e.g. `stats video.framesLate audio`
+  watch [seconds]              one compact stats line every interval (default 1 s) until Ctrl-C
+  settings get [key]           all settings, or one, with range and when a change applies
+  settings set <key> <value> [<key> <value> ...]
+                               change settings as the settings panel would ("default" resets one)
+  tunables                     the video pipeline's runtime-adjustable internals
+  tune <name> <value>          change one while streaming
+  trace [seconds]              per-frame trace of the last seconds (default 10) -> JSON Lines file
+  frames [count]               save the next count (default 8) presented pictures
+  capture [seconds]            write the last seconds of the encoded stream (default: everything
+                               buffered, 60 s) as a PSCAP1 file
+  capture start [seconds]      record the encoded stream to disk from now on
+  capture stop                 end that recording
+  capture status               flight recorder state
+  capture arm [seconds]        keep a keyframe in the buffer by requesting one every so often
+                               (default 20 s), so every capture is decodable from its start
+  capture disarm               stop doing that
+  record start|stop|status     the passthrough movie recorder
+  mark <text>                  write a line into core.log
+  log [n] [--grep TEXT]        the last n log lines (default 40); with --grep only lines containing
+                               TEXT, case-insensitive ("hitch|mark" matches either)
+  reconnect [--wake] [--wait]  end the session and connect again (applies next-connection settings)
+  disconnect                   end the session
+  relaunch [bundle.app] [--when-idle] [--idle-seconds N] [--timeout N]
+           [--on-timeout relaunch|cancel] [--wait]
+                               end the session, start the bundle (default: the running one) and
+                               exit; the new instance reconnects by itself. --when-idle waits
+                               until the controller has been untouched for N seconds (default 5).
+                               --wait blocks until the new instance is up and streaming again.
+  relaunch cancel              cancel a relaunch that is waiting for idle
+  ping | help
+
+The socket is ~/Library/Application Support/PlayStream/control.sock (override with --socket
+or PSCTL_SOCKET). Exit status: 0 ok, 1 the app reported an error, 2 no app to talk to, 3 usage.
+"""
+
+import json
+import os
+import socket
+import sys
+import time
+
+DEFAULT_SOCKET = os.path.expanduser("~/Library/Application Support/PlayStream/control.sock")
+
+# Options that never take a value (so a path after them is not swallowed).
+FLAGS = {"when-idle", "wake", "cancel", "wait"}
+
+
+class Unreachable(Exception):
+    pass
+
+
+def request(sock_path, command, args=(), opts=None, timeout=60.0):
+    """Send one request, return the decoded response object."""
+    s = None
+    for attempt in range(3):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(sock_path)
+            break
+        except ConnectionRefusedError as e:
+            # The app is there but momentarily not accepting (many clients at once); once more.
+            s.close()
+            if attempt == 2:
+                raise Unreachable(str(e))
+            time.sleep(0.1)
+        except OSError as e:
+            s.close()
+            raise Unreachable(str(e))
+    try:
+        payload = json.dumps({"cmd": command, "args": [str(a) for a in args], "opts": opts or {}})
+        s.sendall(payload.encode("utf-8") + b"\n")
+        chunks = []
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except socket.timeout:
+        raise Unreachable("no answer within %g s" % timeout)
+    finally:
+        s.close()
+    raw = b"".join(chunks)
+    if not raw:
+        raise Unreachable("the app closed the connection without answering")
+    return json.loads(raw.decode("utf-8"))
+
+
+def parse(argv):
+    """Split the command line into client options, command, positional args and options."""
+    client = {"socket": os.environ.get("PSCTL_SOCKET", DEFAULT_SOCKET), "timeout": None, "json": False}
+    i = 0
+    while i < len(argv) and argv[i].startswith("--"):
+        name = argv[i][2:]
+        if name == "json":
+            client["json"] = True
+            i += 1
+        elif name in ("socket", "timeout") and i + 1 < len(argv):
+            client[name] = argv[i + 1] if name == "socket" else float(argv[i + 1])
+            i += 2
+        elif name.startswith("socket="):
+            client["socket"] = name.split("=", 1)[1]
+            i += 1
+        elif name in ("help",):
+            return client, "help-local", [], {}
+        else:
+            break
+    rest = argv[i:]
+    if not rest:
+        return client, "help-local", [], {}
+    command, rest = rest[0], rest[1:]
+    args, opts = [], {}
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        if token.startswith("--") and len(token) > 2:
+            name = token[2:]
+            if "=" in name:
+                name, value = name.split("=", 1)
+                opts[name] = value
+            elif name == "json":
+                client["json"] = True
+            elif name in FLAGS or i + 1 >= len(rest) or rest[i + 1].startswith("--"):
+                opts[name] = True
+            else:
+                opts[name] = rest[i + 1]
+                i += 1
+        else:
+            args.append(token)
+        i += 1
+    return client, command, args, opts
+
+
+def fail(message, code=1):
+    sys.stderr.write("psctl: %s\n" % message)
+    sys.exit(code)
+
+
+def call(client, command, args=(), opts=None, timeout=None):
+    """Request that exits with a message when the app cannot be reached or reports an error."""
+    try:
+        response = request(client["socket"], command, args, opts, timeout or client["timeout"] or 60.0)
+    except Unreachable as e:
+        fail("cannot reach PlayStream at %s (%s). Is the app running, and is the control channel on in its settings?"
+             % (client["socket"], e), 2)
+    if not response.get("ok"):
+        fail(response.get("error", "unknown error"), 1)
+    return response.get("result", {})
+
+
+def render(value, depth=0):
+    """JSON, indented, but with lists of plain values on one line (the stats carry histories
+    of a few hundred numbers)."""
+    pad = "  " * depth
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        rows = ["%s  %s: %s" % (pad, json.dumps(k, ensure_ascii=False), render(value[k], depth + 1)) for k in sorted(value)]
+        return "{\n" + ",\n".join(rows) + "\n" + pad + "}"
+    if isinstance(value, list):
+        if all(not isinstance(v, (dict, list)) for v in value):
+            return json.dumps(value, ensure_ascii=False)
+        rows = ["%s  %s" % (pad, render(v, depth + 1)) for v in value]
+        return "[\n" + ",\n".join(rows) + "\n" + pad + "]"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def show(value):
+    print(render(value))
+
+
+def select(value, path):
+    """Walk a dotted path ("video.framesLate") into a result."""
+    for part in path.split("."):
+        if isinstance(value, dict) and part in value:
+            value = value[part]
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            fail("no \"%s\" in the result (at \"%s\")" % (path, part), 3)
+    return value
+
+
+def fmt(value, digits=1):
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, float):
+        return ("%." + str(digits) + "f") % value
+    return str(value)
+
+
+def print_settings(listing):
+    width = max(len(s["key"]) for s in listing)
+    for s in listing:
+        allowed = ""
+        if "allowed" in s:
+            allowed = "one of " + ", ".join(str(a) for a in s["allowed"])
+        elif "range" in s:
+            allowed = "%g to %g" % (s["range"][0], s["range"][1])
+        elif s["type"] == "bool":
+            allowed = "on/off"
+        value = "%g" % s["value"] if isinstance(s["value"], float) else fmt(s["value"])
+        mark = " " if s.get("isDefault") else "*"
+        print("%s %-*s  %-8s  %-16s  %-22s  %s" % (mark, width, s["key"], value, s["applies"], allowed, s["summary"]))
+    print("\n* = changed from the default. `psctl settings set <key> <value>`; \"default\" resets.")
+
+
+def watch_line(stats):
+    v = stats.get("video") or {}
+    a = stats.get("audio") or {}
+    s = stats.get("session") or {}
+    parts = [
+        time.strftime("%H:%M:%S"),
+        "out %s fps" % fmt(v.get("presentedFPS") or v.get("decodedFPS"), 0),
+        "frame p99 %s max %s ms" % (fmt(v.get("frameTimeP99Ms")), fmt(v.get("frameTimeMaxMs"))),
+        "glass %s ms" % fmt(v.get("glassAvgMs")),
+        "%s Mbit/s" % fmt((s.get("measuredBitrate") or 0) / 1e6),
+        "rtt %s ms" % fmt(s.get("rttMilliseconds")),
+        "loss %s%%" % fmt((s.get("packetLoss") or 0) * 100, 2),
+        "gap %s ms" % fmt(v.get("arrivalMaxGapMs"), 0),
+        "late %s drop %s lost %s" % (fmt(v.get("framesLate")), fmt(v.get("framesDropped")), fmt(v.get("framesLostInNetwork"))),
+        "audio %s ms under %s" % (fmt(a.get("bufferedMs"), 0), fmt(a.get("underruns"))),
+    ]
+    return " | ".join(parts)
+
+
+def wait_for_stream(client, old_pid, deadline, what, last_before=None):
+    """Poll status until a (new) instance is streaming. Returns its status or exits."""
+    last = ""
+    while time.time() < deadline:
+        try:
+            response = request(client["socket"], "status", timeout=5)
+        except (Unreachable, ValueError):
+            state = "app not answering (restarting)"
+            response = None
+        if response and response.get("ok"):
+            status = response["result"]
+            session = status.get("session") or {}
+            pid = status.get("pid")
+            if old_pid is not None and pid == old_pid:
+                pending = status.get("pendingRelaunch")
+                if pending:
+                    state = "waiting for the controller to go idle (idle now %s s, needs %s s)" % (
+                        fmt(status.get("controllerIdleSeconds")), fmt(pending.get("idleSeconds")))
+                elif status.get("lastRelaunch") and status.get("lastRelaunch") != last_before:
+                    return status  # the host decided not to restart (dry run or timeout); report it
+                else:
+                    state = "old instance (pid %s) is shutting down" % pid
+            elif session.get("phase") == "streaming":
+                sys.stderr.write("psctl: %s: streaming again, pid %s\n" % (what, pid))
+                return status
+            else:
+                state = "new instance (pid %s) is up, session %s" % (pid, session.get("phase") or session.get("resume") or "not started")
+        elif response is not None:
+            state = response.get("error", "error")
+        if state != last:
+            sys.stderr.write("psctl: %s: %s\n" % (what, state))
+            last = state
+        time.sleep(0.5)
+    fail("%s: gave up waiting (last state: %s)" % (what, last or "unknown"), 1)
+
+
+def main():
+    client, command, args, opts = parse(sys.argv[1:])
+
+    if command == "help-local":
+        print(__doc__.strip())
+        return
+
+    # Shorthands
+    if command == "get":
+        command, args = "settings", ["get"] + args
+    elif command == "set":
+        command, args = "settings", ["set"] + args
+    elif command == "settings" and not args:
+        args = ["get"]
+    elif command == "capture" and args and args[0] in ("arm", "disarm"):
+        seconds = "0" if args[0] == "disarm" else (args[1] if len(args) > 1 else "20")
+        command, args = "settings", ["set", "debug.flightRecorderKeyframeSeconds", seconds]
+
+    if command == "watch":
+        interval = float(args[0]) if args else 1.0
+        try:
+            while True:
+                print(watch_line(call(client, "stats")), flush=True)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            return
+
+    wait = bool(opts.pop("wait", False))
+    wait_timeout = float(opts.pop("wait-timeout", 0) or 0)
+
+    if command in ("relaunch", "reconnect") and wait:
+        before = call(client, "status", timeout=10)
+        result = call(client, command, args, opts)
+        if result.get("cancelled"):
+            show(result)
+            return
+        budget = wait_timeout or (90 + (float(result.get("timeoutSeconds") or 0) if result.get("waitingForIdle") else 0))
+        old_pid = before.get("pid") if command == "relaunch" else None
+        if command == "reconnect":
+            time.sleep(1.0)  # let the old session go down before looking for the new one
+        status = wait_for_stream(client, old_pid, time.time() + budget, command, before.get("lastRelaunch"))
+        show({"request": result, "status": status})
+        # After a relaunch, make sure the instance that answers is the build that was asked for:
+        # when a new build fails to start, the relaunch helper brings the previous one back.
+        app = status.get("app") or {}
+        wanted = result.get("bundle")
+        if command == "relaunch" and status.get("pid") != old_pid and wanted and app.get("bundlePath") \
+                and os.path.realpath(wanted) != os.path.realpath(app["bundlePath"]):
+            fail("the instance now running is %s (build %s), not the requested %s: the new build did not come up "
+                 "and the previous one was started again. See ~/Library/Logs/PlayStream/relaunch.log."
+                 % (app["bundlePath"], app.get("gitCommit"), wanted), 1)
+        if command == "relaunch" and status.get("pid") != old_pid:
+            sys.stderr.write("psctl: now running build %s (built %s)\n" % (app.get("gitCommit"), app.get("buildTime")))
+        return
+
+    # Commands that wait for the stream (pictures to be presented, a file to be written) may
+    # take longer than the usual answer.
+    patience = None
+    if command == "frames":
+        patience = 60 + 0.5 * (float(args[0]) if args else 8)
+    elif command in ("capture", "trace", "record"):
+        patience = 180
+    # `psctl stats video.framesLate audio` prints only those parts (status likewise).
+    paths = []
+    if command in ("stats", "status") and args:
+        paths, args = args, []
+    result = call(client, command, args, opts, timeout=client["timeout"] or patience)
+    if paths:
+        if len(paths) == 1:
+            show(select(result, paths[0]))
+        else:
+            show({path: select(result, path) for path in paths})
+        return
+
+    if client["json"]:
+        show(result)
+    elif command == "log":
+        for line in result.get("lines", []):
+            print(line)
+    elif command == "help":
+        for entry in result.get("commands", []):
+            print("  %-48s %s" % (entry["usage"], entry["summary"]))
+    elif command == "settings" and args[:1] in (["get"], ["list"]) and "settings" in result:
+        print_settings(result["settings"])
+    elif command == "tunables" and isinstance(result.get("tunables"), dict):
+        for name in sorted(result["tunables"]):
+            print("%-40s %s" % (name, result["tunables"][name]))
+    else:
+        show(result)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass

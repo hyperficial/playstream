@@ -9,6 +9,8 @@ struct StreamView: View {
 	@ObservedObject var settings: AppSettings
 	@ObservedObject var recorder: StreamRecorder
 	let input: ControllerInput
+	/// A short line shown at the top while something is pending (a restart waiting for a pause).
+	let notice: String?
 	let onDisconnect: () -> Void
 
 	@State private var showControls = false
@@ -16,10 +18,11 @@ struct StreamView: View {
 	@State private var hideTask: Task<Void, Never>?
 	@State private var pin = ""
 
-	init(controller: StreamController, settings: AppSettings, input: ControllerInput, onDisconnect: @escaping () -> Void) {
+	init(controller: StreamController, settings: AppSettings, input: ControllerInput, notice: String? = nil, onDisconnect: @escaping () -> Void) {
 		self.controller = controller
 		self.settings = settings
 		self.input = input
+		self.notice = notice
 		self.recorder = controller.recorder
 		self.onDisconnect = onDisconnect
 	}
@@ -52,6 +55,13 @@ struct StreamView: View {
 						StatsOverlay(stats: controller.liveStats, history: controller.history, profile: controller.configuration.profile, level: level)
 					}
 					Spacer()
+					if let notice {
+						Text(notice)
+							.font(.callout)
+							.padding(.horizontal, 12)
+							.padding(.vertical, 7)
+							.background(.regularMaterial, in: Capsule())
+					}
 					if recorder.state.isBusy { RecordingBadge(recorder: recorder) }
 				}
 				Spacer()

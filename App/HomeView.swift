@@ -78,6 +78,7 @@ struct HomeView: View {
 								isConnecting: model.connectingHostID == entry.id,
 								progress: model.connectingHostID == entry.id ? model.connectProgress : nil,
 								onConnect: { model.connect(to: entry) },
+								onCancel: { model.cancelConnect() },
 								onPair: { pair(entry.id) },
 								onWake: { model.wake(entry) },
 								onForget: { store.remove(id: entry.id) }
@@ -158,6 +159,7 @@ private struct ConsoleCard: View {
 	let isConnecting: Bool
 	let progress: String?
 	let onConnect: () -> Void
+	let onCancel: () -> Void
 	let onPair: () -> Void
 	let onWake: () -> Void
 	let onForget: () -> Void
@@ -191,6 +193,7 @@ private struct ConsoleCard: View {
 				if isConnecting {
 					ProgressView().controlSize(.small)
 					Text(progress ?? "Connecting…").font(.callout).foregroundStyle(.secondary)
+					Button("Cancel", action: onCancel)
 				} else if entry.registered != nil {
 					Button(entry.state == .standby ? "Wake and connect" : "Connect", action: onConnect)
 						.buttonStyle(.borderedProminent)

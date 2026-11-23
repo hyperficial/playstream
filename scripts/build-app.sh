@@ -1,14 +1,29 @@
 #!/bin/bash
 # Generates the Xcode project and builds PlayStream.app.
-# Usage: build-app.sh [Release|Debug]   (default Release -> build/release, Debug -> build/app)
-set -euo pipefail
+# Usage: build-app.sh [Release|Debug] [output-dir]
+#   default output: Release -> build/release, Debug -> build/app
+# Never build into the directory of a PlayStream that is running: use scripts/hot-swap.sh,
+# which builds into a free slot and swaps the new build in.
+# Exit status is xcodebuild's, so callers can tell a failed build from a finished one.
+set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 CONFIG="${1:-Release}"
 if [ "$CONFIG" = "Release" ]; then OUT="$ROOT/build/release"; else OUT="$ROOT/build/app"; fi
-[ -f build/chiaki/lib/libchiaki.a ] || ./scripts/build-chiaki.sh
-xcodegen generate --quiet
+if [ -n "${2:-}" ]; then
+	mkdir -p "$2"
+	OUT="$(cd "$2" && pwd)"
+fi
+[ -f build/chiaki/lib/libchiaki.a ] || ./scripts/build-chiaki.sh || exit 1
+xcodegen generate --quiet || exit 1
+LOG="$ROOT/build/xcodebuild-last.log"
 xcodebuild -project PlayStream.xcodeproj -scheme PlayStream -configuration "$CONFIG" \
 	-derivedDataPath build/xcode -destination 'platform=macOS,arch=arm64' \
-	CONFIGURATION_BUILD_DIR="$OUT" build 2>&1 | grep -E "error|warning: unre|BUILD|Signing Identity" || true
+	CONFIGURATION_BUILD_DIR="$OUT" build > "$LOG" 2>&1
+STATUS=$?
+grep -E "error:|warning: unre|\*\* BUILD|Signing Identity|^stamp-build" "$LOG" || true
+if [ $STATUS -ne 0 ]; then
+	echo "Build failed (full log: $LOG)"
+	exit $STATUS
+fi
 echo "App: $OUT/PlayStream.app"

@@ -112,6 +112,17 @@ struct SettingsView: View {
 			Section("Audio") {
 				Slider(value: settings.$volume, in: 0...1) { Text("Volume") }
 			}
+			Section("Developer") {
+				Toggle("Reconnect at launch", isOn: settings.$autoReconnect)
+				Text("After a restart the app goes straight back to the console it was streaming from. It does not do so when you disconnected first, or when you quit and come back more than five minutes later. Hold Option while opening the app to skip it once.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+				Toggle("Control channel for psctl", isOn: settings.$controlChannel)
+				Text("Lets the scripts/psctl command inspect and tune the running app from the terminal, through a socket in Application Support that only your user account can open.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+				Toggle("Note hitches in the log", isOn: settings.$hitchNotes)
+			}
 			Section {
 				Text("Other video changes apply to the next connection.")
 					.font(.caption)
