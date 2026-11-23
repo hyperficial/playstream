@@ -131,13 +131,14 @@ struct StatsOverlay: View {
 				Spacer()
 				Text(trailing)
 			}
+			let capacity = StreamController.historyLength
 			Canvas { context, size in
 				let top = max(ceiling, 1)
 				func path(_ series: [Double]) -> Path {
 					var path = Path()
 					guard series.count > 1 else { return path }
-					let step = size.width / CGFloat(StreamController.historyLength - 1)
-					let offset = CGFloat(StreamController.historyLength - series.count) * step
+					let step = size.width / CGFloat(capacity - 1)
+					let offset = CGFloat(capacity - series.count) * step
 					for (index, value) in series.enumerated() {
 						let y = size.height - CGFloat(min(max(value, 0), top) / top) * size.height
 						let point = CGPoint(x: offset + CGFloat(index) * step, y: y)
