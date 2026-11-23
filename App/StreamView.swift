@@ -51,7 +51,11 @@ struct StreamView: View {
 
 			VStack {
 				HStack(alignment: .top) {
-					if let level = StatsLevel(rawValue: settings.statsLevel), level != .off {
+					// On the Metal renderer the stats are drawn into the video picture itself
+					// (StreamController.updateInFrameOverlay), so nothing sits above the video layer
+					// and the display's direct path stays available. Only the fallback renderer
+					// still needs a view on top.
+					if let level = StatsLevel(rawValue: settings.statsLevel), level != .off, !controller.drawsOverlayInFrame {
 						StatsOverlay(stats: controller.liveStats, history: controller.history, profile: controller.configuration.profile, level: level)
 					}
 					Spacer()

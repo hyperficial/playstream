@@ -332,6 +332,31 @@ final class StreamController: ObservableObject {
 
 	private var statsTick = 0
 
+	/// True while the stats overlay is composited into the video frame by the pipeline.
+	@Published private(set) var drawsOverlayInFrame = false
+	private var overlayInFrameShown = false
+
+	/// Renders the stats overlay to an image and hands it to the pipeline, which draws it into
+	/// the video frame. Called at the stats rate; costs nothing on the frame path.
+	private func updateInFrameOverlay() {
+		let level = StatsLevel(rawValue: settings.statsLevel) ?? .off
+		let inFrame = video.displayMode == .metal
+		if drawsOverlayInFrame != inFrame { drawsOverlayInFrame = inFrame }
+		guard inFrame, level != .off else {
+			if overlayInFrameShown {
+				video.removeOverlay()
+				overlayInFrameShown = false
+			}
+			return
+		}
+		let renderer = ImageRenderer(content: StatsOverlay(stats: liveStats, history: history, profile: configuration.profile, level: level))
+		renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+		renderer.isOpaque = false
+		guard let image = renderer.cgImage else { return }
+		video.setOverlay(image, origin: CGPoint(x: 16, y: 16))
+		overlayInFrameShown = true
+	}
+
 	private func refreshStats() {
 		var stats = LiveStats()
 		stats.video = video.stats
@@ -354,6 +379,7 @@ final class StreamController: ObservableObject {
 			arrivalGapMs: stats.video.arrivalMaxGapMs
 		))
 		if history.count > Self.historyLength { history.removeFirst(history.count - Self.historyLength) }
+		updateInFrameOverlay()
 
 		noteHitches(stats, outputFPS: outputFPS)
 
