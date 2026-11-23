@@ -114,7 +114,7 @@ struct SettingsView: View {
 			}
 			Section("Developer") {
 				Toggle("Reconnect at launch", isOn: settings.$autoReconnect)
-				Text("After a restart the app goes straight back to the console it was streaming from. It does not do so when you disconnected first, or when you quit and come back more than a quarter of an hour later. Hold Option while opening the app to skip it once.")
+				Text("After a restart the app goes straight back to the console it was streaming from. It does not do so when you disconnected first, or when you quit and come back more than five minutes later. Hold Option while opening the app to skip it once.")
 					.font(.caption)
 					.foregroundStyle(.secondary)
 				Toggle("Control channel for psctl", isOn: settings.$controlChannel)

@@ -54,14 +54,15 @@ public struct ControlRequest {
 	public func arg(_ index: Int) -> String? { index < args.count ? args[index] : nil }
 
 	public func double(_ name: String) -> Double? {
+		// Not-a-number never gets through: every caller compares or converts the result.
 		switch options[name] {
-		case let n as NSNumber: return n.doubleValue
-		case let s as String: return Double(s)
+		case let n as NSNumber: return n.doubleValue.isNaN ? nil : n.doubleValue
+		case let s as String: return Double(s).flatMap { $0.isNaN ? nil : $0 }
 		default: return nil
 		}
 	}
 
-	public func int(_ name: String) -> Int? { double(name).flatMap { $0.isFinite ? Int($0) : nil } }
+	public func int(_ name: String) -> Int? { double(name).flatMap { $0.isFinite ? Int(min(max($0, -1e15), 1e15)) : nil } }
 
 	public func string(_ name: String) -> String? {
 		guard let value = options[name], !(value is NSNull) else { return nil }
@@ -104,8 +105,7 @@ public struct ControlResponse {
 		var object: [String: Any] = ["ok": ok]
 		if let result { object["result"] = JSONValue.sanitized(result) }
 		if let error { object["error"] = error }
-		var data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]))
-			?? Data(#"{"ok":false,"error":"response could not be encoded"}"#.utf8)
+		var data = JSONValue.encode(object) ?? Data(#"{"ok":false,"error":"response could not be encoded"}"#.utf8)
 		data.append(0x0A)
 		return data
 	}
@@ -120,6 +120,14 @@ public enum JSONValue {
 	}()
 
 	public static func string(from date: Date) -> String { dateFormatter.string(from: date) }
+
+	/// Compact JSON for an already sanitized value, or nil when it still is not valid JSON.
+	/// `JSONSerialization` raises an Objective-C exception for an invalid object, which would
+	/// take the whole process down, so validity is checked first.
+	public static func encode(_ object: Any) -> Data? {
+		guard JSONSerialization.isValidJSONObject(object) else { return nil }
+		return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+	}
 
 	/// A JSON-safe copy of a value built from dictionaries, arrays and scalars: non-finite
 	/// numbers become null, dates ISO 8601, URLs paths, anything unknown its description.

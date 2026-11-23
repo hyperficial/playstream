@@ -92,7 +92,7 @@ public enum SettingsCatalog {
 
 		// No-click restart
 		bool("resume.autoReconnect", true, .nextLaunch, "At launch, reconnect to the console that was streaming when the app last quit or crashed. (`psctl relaunch` always brings its session back.)"),
-		double("resume.windowSeconds", 900, 0...86_400, .nextLaunch, "How long after a quit (or crash) a launch still resumes the session, seconds. Later than that, the owner was done playing. 0: never."),
+		double("resume.windowSeconds", 300, 0...86_400, .nextLaunch, "How long after a quit (or crash) a launch still resumes the session, seconds. Later than that, the owner was done playing. 0: never."),
 	]
 
 	private static let byKey: [String: SettingDescriptor] = Dictionary(uniqueKeysWithValues: all.map { ($0.key, $0) })
@@ -108,6 +108,9 @@ public enum SettingsCatalog {
 
 	// MARK: Reading
 
+	/// The setting's value as a `Bool`, `Int` or `Double`. Whatever is stored (the store can be
+	/// edited by hand) is brought into the setting's range, or replaced by the default when it
+	/// is not usable at all, so callers can compute with the result without checking it again.
 	public static func value(of descriptor: SettingDescriptor, in defaults: UserDefaults) -> Any {
 		let stored = defaults.object(forKey: descriptor.key)
 		switch descriptor.kind {
@@ -115,14 +118,20 @@ public enum SettingsCatalog {
 			if let n = stored as? NSNumber { return n.boolValue }
 			if let s = stored as? String, let b = parseBool(s) { return b }
 			return descriptor.defaultValue != 0
-		case .int:
-			if let n = stored as? NSNumber { return n.intValue }
-			if let s = stored as? String, let i = Int(s) { return i }
-			return Int(descriptor.defaultValue)
-		case .double:
-			if let n = stored as? NSNumber { return n.doubleValue }
-			if let s = stored as? String, let d = Double(s) { return d }
-			return descriptor.defaultValue
+		case .int(let range, let allowed, _):
+			var number: Double?
+			if let n = stored as? NSNumber { number = n.doubleValue }
+			if let s = stored as? String { number = Double(s) }
+			guard let number, number.isFinite else { return Int(descriptor.defaultValue) }
+			let value = Int(min(max(number.rounded(), Double(range.lowerBound)), Double(range.upperBound)))
+			if let allowed, !allowed.contains(value) { return Int(descriptor.defaultValue) }
+			return value
+		case .double(let range):
+			var number: Double?
+			if let n = stored as? NSNumber { number = n.doubleValue }
+			if let s = stored as? String { number = Double(s) }
+			guard let number, number.isFinite else { return descriptor.defaultValue }
+			return min(max(number, range.lowerBound), range.upperBound)
 		}
 	}
 

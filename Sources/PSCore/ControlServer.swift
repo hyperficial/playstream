@@ -113,7 +113,7 @@ public final class ControlServer: @unchecked Sendable {
 			throw ServerError.system("bind", bindError)
 		}
 		chmod(path, 0o600)
-		guard listen(fd, 8) == 0 else {
+		guard listen(fd, 64) == 0 else {
 			let code = errno
 			close(fd)
 			unlink(path)
@@ -317,7 +317,7 @@ public enum ControlClient {
 		}
 		guard connected == 0 else { throw ControlError("cannot connect to \(path): \(String(cString: strerror(errno)))") }
 
-		var body = try JSONSerialization.data(withJSONObject: ["cmd": request.command, "args": request.args, "opts": request.options])
+		guard var body = JSONValue.encode(JSONValue.sanitized(["cmd": request.command, "args": request.args, "opts": request.options] as [String: Any])) else { throw ControlError("request cannot be encoded") }
 		body.append(0x0A)
 		let sent = body.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
 		guard sent == body.count else { throw ControlError("could not send the request") }

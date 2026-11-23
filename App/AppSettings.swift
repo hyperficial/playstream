@@ -73,11 +73,15 @@ final class AppSettings: ObservableObject {
 
 	func profile(isPS5: Bool) -> StreamProfile {
 		let size = resolution.size
+		// The stored values can be edited from outside the app; keep what goes to the console
+		// within what the settings panel could have produced.
+		let range = AppSettings.bitrateRange
+		let rate = bitrateMbps.isFinite ? min(max(bitrateMbps, range.lowerBound), range.upperBound) : 30
 		return StreamProfile(
 			width: size.width,
 			height: size.height,
-			fps: fps,
-			bitrateKbps: Int(bitrateMbps * 1000),
+			fps: fps == 30 ? 30 : 60,
+			bitrateKbps: Int(rate * 1000),
 			codec: isPS5 ? codec : .h264
 		)
 	}

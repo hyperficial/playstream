@@ -118,7 +118,7 @@ public struct HitchDetector {
 			return nil
 		}
 		defer { previous = sample }
-		guard let last = previous, sample.framesReceived >= last.framesReceived, sample.time > last.time else {
+		guard let last = previous, sample.framesReceived >= last.framesReceived, sample.time.isFinite, sample.time > last.time else {
 			// First sample of a session, or the counters started over.
 			startedAt = sample.time
 			lastFrameAt = sample.time
@@ -151,7 +151,8 @@ public struct HitchDetector {
 
 		// Display: the presented intervals that are new since the last sample.
 		if !sample.presentedIntervalsMs.isEmpty {
-			let expected = Int((max(sample.presentedFPS, 1) * dt).rounded())
+			let rate = sample.presentedFPS.isFinite ? min(max(sample.presentedFPS, 1), 1000) : 1
+			let expected = Int((rate * min(dt, 60)).rounded())
 			let fresh = Self.newEntries(previous: last.presentedIntervalsMs, current: sample.presentedIntervalsMs, expected: expected)
 			let nominal = Self.median(sample.presentedIntervalsMs)
 			if nominal > 0, !fresh.isEmpty {

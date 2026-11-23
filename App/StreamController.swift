@@ -216,7 +216,7 @@ final class StreamController: ObservableObject {
 			changes.append(limits.seconds > 0 ? "flight recorder \(Int(limits.seconds)) s / \(megabytes) MiB" : "flight recorder off")
 		}
 		let keyframeInterval = SettingsCatalog.double("debug.flightRecorderKeyframeSeconds", in: defaults)
-		if captureTee.keyframeIntervalSeconds != (keyframeInterval > 0 ? max(0.5, keyframeInterval) : 0) {
+		if abs(captureTee.keyframeIntervalSeconds - (keyframeInterval > 0 ? max(0.5, keyframeInterval) : 0)) > 0.001 {
 			captureTee.keyframeIntervalSeconds = keyframeInterval
 			changes.append(keyframeInterval > 0 ? "flight recorder keyframe every \(Int(keyframeInterval)) s" : "flight recorder keyframe requests off")
 		}

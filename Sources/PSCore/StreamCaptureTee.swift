@@ -176,6 +176,13 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 	@inline(__always)
 	private static func nowNs() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
 
+	/// Seconds as nanoseconds for any input: not-a-number and negative values count as 0 and
+	/// nothing is longer than a day, so the conversion can never trap on a stream thread.
+	private static func nanoseconds(_ seconds: Double) -> UInt64 {
+		guard seconds.isFinite, seconds > 0 else { return 0 }
+		return UInt64(min(seconds, 86_400) * 1e9)
+	}
+
 	// MARK: Configuration (any thread)
 
 	/// Retention of the in-memory recorder. Shrinking it or turning it off releases memory at once.
@@ -183,7 +190,8 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 		get { locked { limitsValue } }
 		set {
 			locked {
-				limitsValue = Limits(seconds: max(0, newValue.seconds), bytes: max(0, newValue.bytes))
+				let seconds = newValue.seconds.isFinite ? min(max(0, newValue.seconds), 86_400) : 0
+				limitsValue = Limits(seconds: seconds, bytes: min(max(0, newValue.bytes), 64 << 30))
 				if !ringEnabledLocked, capture == nil {
 					slabs.removeAll()
 					spareSlab = nil
@@ -200,7 +208,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 	/// start. Off (0) by default: each keyframe is a burst of data the stream otherwise never has.
 	public var keyframeIntervalSeconds: Double {
 		get { locked { Double(keyframeIntervalNs) / 1e9 } }
-		set { locked { keyframeIntervalNs = newValue > 0 ? UInt64(max(0.5, newValue) * 1e9) : 0 } }
+		set { locked { keyframeIntervalNs = newValue > 0 ? max(Self.nanoseconds(0.5), Self.nanoseconds(newValue)) : 0 } }
 	}
 
 	private var ringEnabledLocked: Bool { limitsValue.seconds > 0 && limitsValue.bytes > 0 }
@@ -314,7 +322,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 	/// The newest slab always stays.
 	private func evictLocked(now: UInt64) {
 		let ringOn = ringEnabledLocked
-		let windowNs = ringOn ? UInt64(limitsValue.seconds * 1e9) : 0
+		let windowNs = ringOn ? Self.nanoseconds(limitsValue.seconds) : 0
 		let maxBytes = ringOn ? limitsValue.bytes : 0
 		while slabs.count > 1 {
 			let newestInOldest = slabs[0].records.last?.arrivalNs ?? 0
@@ -430,7 +438,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 				var warnings: [String] = []
 				var first = 0
 				if let lastSeconds, lastSeconds > 0 {
-					let span = UInt64(lastSeconds * 1e9)
+					let span = Self.nanoseconds(lastSeconds)
 					let cut = snapshot.reference > span ? snapshot.reference - span : 0
 					first = all.firstIndex { $0.1.arrivalNs >= cut } ?? all.count - 1
 				}
@@ -459,7 +467,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 				notes["hasStreamHeader"] = header != nil
 				notes["headerRecordRetimed"] = "the stream header record carries the arrival time of the first frame (0)"
 				if !warnings.isEmpty { notes["warnings"] = warnings }
-				let startedAt = wallNow.addingTimeInterval(-Double(now &- startNs) / 1e9)
+				let startedAt = wallNow.addingTimeInterval(-Self.seconds(from: startNs, to: now))
 				let writer = try StreamCaptureWriter(url: url, header: StreamCaptureHeader(
 					profile: snapshot.profile ?? .ps5Max, startedAt: startedAt, notes: Self.notesText(notes)))
 				do {
@@ -470,7 +478,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 						// A header buffer that is already the first record is not written twice.
 						if rec.kind == .header, let header, rec.arrivalNs == header.arrivalNs { continue }
 						try writer.append(
-							arrivalNanoseconds: rec.arrivalNs - startNs, framesLost: Int(rec.flags & 0xFFFF), frameRecovered: rec.flags & (1 << 16) != 0,
+							arrivalNanoseconds: rec.arrivalNs > startNs ? rec.arrivalNs - startNs : 0, framesLost: Int(rec.flags & 0xFFFF), frameRecovered: rec.flags & (1 << 16) != 0,
 							bytes: UnsafeRawBufferPointer(start: slab.base + rec.offset, count: rec.length))
 					}
 					try writer.close()
@@ -493,7 +501,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 
 	private static func notesText(_ notes: [String: Any]) -> String {
 		let safe = JSONValue.sanitized(notes)
-		guard let data = try? JSONSerialization.data(withJSONObject: safe, options: [.sortedKeys, .withoutEscapingSlashes]) else { return "\(notes)" }
+		guard let data = JSONValue.encode(safe) else { return "\(notes)" }
 		return String(decoding: data, as: UTF8.self)
 	}
 
@@ -508,7 +516,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 		try locked {
 			guard capture == nil else { throw ControlError("a capture is already running: \(capture!.url.path)") }
 			guard streaming else { throw ControlError("no stream is running") }
-			let deadline = maxSeconds.flatMap { $0 > 0 ? now + UInt64($0 * 1e9) : nil }
+			let deadline = maxSeconds.flatMap { Self.nanoseconds($0) > 0 ? now + Self.nanoseconds($0) : nil }
 			capture = DiskCapture(url: url, startedNs: now, deadlineNs: deadline, maxBytes: max(1 << 20, maxBytes))
 			lastKeyframeRequestNs = now
 		}
@@ -538,7 +546,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 				opening = true
 			} else if rec.kind == .header {
 				return (nil, nil) // goes in as the first record once the capture opens
-			} else if now > capture.startedNs + UInt64(keyframeWaitSeconds * 1e9) {
+			} else if now > capture.startedNs + Self.nanoseconds(keyframeWaitSeconds) {
 				capture.warnings.append("No keyframe arrived within \(keyframeWaitSeconds) s of the request: this capture does not start with a keyframe and cannot be decoded from its start.")
 				items = capture.pending + [(slab, rec)]
 				capture.pending.removeAll()
@@ -578,7 +586,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 				do {
 					for (slab, r) in items {
 						try writer.append(
-							arrivalNanoseconds: r.arrivalNs &- base, framesLost: Int(r.flags & 0xFFFF), frameRecovered: r.flags & (1 << 16) != 0,
+							arrivalNanoseconds: r.arrivalNs > base ? r.arrivalNs - base : 0, framesLost: Int(r.flags & 0xFFFF), frameRecovered: r.flags & (1 << 16) != 0,
 							bytes: UnsafeRawBufferPointer(start: slab.base + r.offset, count: r.length))
 					}
 				} catch {
@@ -599,10 +607,10 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 		if header == nil { capture.warnings.append("No stream header (parameter sets) was seen in this session: the capture has none.") }
 		if header != nil { capture.records += 1 }
 		let profile = self.profile ?? .ps5Max
-		let startedAt = Date().addingTimeInterval(-Double(now &- firstNs) / 1e9)
+		let startedAt = Date().addingTimeInterval(-Self.seconds(from: firstNs, to: now))
 		let startsWithKeyframe = capture.startsWithKeyframe
 		let warnings = capture.warnings
-		let limitSeconds = capture.deadlineNs.map { Double($0 - capture.startedNs) / 1e9 }
+		let limitSeconds = capture.deadlineNs.map { Self.seconds(from: capture.startedNs, to: $0) }
 		return { [self] in
 			var notes = notesProvider?() ?? [:]
 			notes["kind"] = "explicit capture"
@@ -645,7 +653,7 @@ public final class StreamCaptureTee: VideoStreamSink, @unchecked Sendable {
 					do {
 						for (slab, r) in items {
 							try writer.append(
-								arrivalNanoseconds: r.arrivalNs &- base, framesLost: Int(r.flags & 0xFFFF), frameRecovered: r.flags & (1 << 16) != 0,
+								arrivalNanoseconds: r.arrivalNs > base ? r.arrivalNs - base : 0, framesLost: Int(r.flags & 0xFFFF), frameRecovered: r.flags & (1 << 16) != 0,
 								bytes: UnsafeRawBufferPointer(start: slab.base + r.offset, count: r.length))
 						}
 					} catch {

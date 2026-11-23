@@ -302,7 +302,7 @@ public final class ControlRouter: @unchecked Sendable {
 		guard count >= 1, count <= 600 else { throw ControlError("frames takes a count between 1 and 600") }
 		let video = try await videoDebug()
 		let directory = try await onIOThrowing { try self.storage.newDirectory(in: .frames, prefix: "frames") }
-		let timeout = request.double("timeout") ?? (10 + Double(count) * 0.25)
+		let timeout = min(max(request.double("timeout") ?? (10 + Double(count) * 0.25), 1), 600)
 		let files: [URL]? = await withTimeout(seconds: timeout) { done in
 			video.capturePresentedFrames(count: count, to: directory) { done($0) }
 		}
@@ -328,8 +328,8 @@ public final class ControlRouter: @unchecked Sendable {
 			return tee.status
 		case "start":
 			let seconds = Double(request.arg(1) ?? "") ?? request.double("seconds")
-			if let seconds, seconds <= 0 || seconds > 86_400 { throw ControlError("capture start takes a duration between 0 and 86400 seconds") }
-			let megabytes = request.double("maxmegabytes") ?? 4096
+			if let seconds, !(seconds > 0 && seconds <= 86_400) { throw ControlError("capture start takes a duration between 0 and 86400 seconds") }
+			let megabytes = min(max(request.double("maxmegabytes") ?? 4096, 1), 1_000_000)
 			let url = try await onIOThrowing { try self.storage.newFile(in: .captures, prefix: "stream", extension: "pscap") }
 			try tee.startCapture(to: url, maxSeconds: seconds, maxBytes: Int64(megabytes * 1024 * 1024))
 			CoreLog.note("Stream capture started: \(url.lastPathComponent)\(seconds.map { ", for \($0) s" } ?? "")")
@@ -354,9 +354,9 @@ public final class ControlRouter: @unchecked Sendable {
 		default:
 			var seconds: Double?
 			if let first {
-				guard let value = Double(first), value > 0 else { throw ControlError("usage: capture [seconds] | capture start [seconds] | capture stop | capture status") }
+				guard let value = Double(first), value > 0, value.isFinite else { throw ControlError("usage: capture [seconds] | capture start [seconds] | capture stop | capture status") }
 				seconds = value
-			} else if let value = request.double("seconds") {
+			} else if let value = request.double("seconds"), value > 0, value.isFinite {
 				seconds = value
 			}
 			let url = try await onIOThrowing { try self.storage.newFile(in: .captures, prefix: "flight", extension: "pscap") }

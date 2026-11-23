@@ -62,13 +62,22 @@ class Unreachable(Exception):
 
 def request(sock_path, command, args=(), opts=None, timeout=60.0):
     """Send one request, return the decoded response object."""
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect(sock_path)
-    except OSError as e:
-        s.close()
-        raise Unreachable(str(e))
+    s = None
+    for attempt in range(3):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(sock_path)
+            break
+        except ConnectionRefusedError as e:
+            # The app is there but momentarily not accepting (many clients at once); once more.
+            s.close()
+            if attempt == 2:
+                raise Unreachable(str(e))
+            time.sleep(0.1)
+        except OSError as e:
+            s.close()
+            raise Unreachable(str(e))
     try:
         payload = json.dumps({"cmd": command, "args": [str(a) for a in args], "opts": opts or {}})
         s.sendall(payload.encode("utf-8") + b"\n")
