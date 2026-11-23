@@ -38,6 +38,7 @@ final class AppModel: ObservableObject {
 			.sink { CoreLog.note("Discovery: \($0.isEmpty ? "no consoles" : $0.joined(separator: ", "))") }
 			.store(in: &observers)
 		discovery.start()
+		input.diagnosticHandler = { CoreLog.note($0) }
 		input.start()
 		input.installKeyboardMonitor()
 		applyControllerSettings()

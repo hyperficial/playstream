@@ -86,6 +86,13 @@ public final class ControllerInput: ObservableObject, ControllerFeedbackSink, Ha
 		get { lightLevel.value }
 		set { lightLevel.value = min(1, max(0, newValue)); queue.async { [self] in applyLEDAndPlayer() } }
 	}
+	/// Receives a line whenever the touchpad's click / touch state changes, with everything the
+	/// framework reports for it. For diagnosing controllers that report a touch as a click.
+	/// Called on the input queue.
+	public var diagnosticHandler: ((String) -> Void)? {
+		get { diagnostic.value }
+		set { diagnostic.value = newValue }
+	}
 	/// Show the white player-number LEDs below the touchpad (default true).
 	public var playerLEDsEnabled: Bool {
 		get { playerLEDsOn.value }
@@ -110,6 +117,8 @@ public final class ControllerInput: ObservableObject, ControllerFeedbackSink, Ha
 	private let rumbleGainValue = Locked<Float>(1)
 	private let motionOn = Locked(true)
 	private let lightLevel = Locked<Float>(1)
+	private let diagnostic = Locked<((String) -> Void)?>(nil)
+	private var lastTouchpadSignature = ""
 	private let playerLEDsOn = Locked(true)
 	private let backgroundInput = Locked(false)
 	private let hapticsThrottle = Locked<(last: UInt64, l: Float, r: Float)>((0, 0, 0))
@@ -424,7 +433,27 @@ public final class ControllerInput: ObservableObject, ControllerFeedbackSink, Ha
 		}
 		touchTracker.apply(to: &s)
 		orientation.apply(to: &s)
+		if let report = diagnostic.value { reportTouchpad(g, report) }
 		return s
+	}
+
+	private func reportTouchpad(_ g: GCExtendedGamepad, _ report: (String) -> Void) {
+		let button: GCControllerButtonInput
+		let primary: GCControllerDirectionPad, secondary: GCControllerDirectionPad
+		if let ds = g as? GCDualSenseGamepad { (button, primary, secondary) = (ds.touchpadButton, ds.touchpadPrimary, ds.touchpadSecondary) }
+		else if let d4 = g as? GCDualShockGamepad { (button, primary, secondary) = (d4.touchpadButton, d4.touchpadPrimary, d4.touchpadSecondary) }
+		else { return }
+		let down0 = InputMapping.isFingerDown(x: primary.xAxis.value, y: primary.yAxis.value)
+		let down1 = InputMapping.isFingerDown(x: secondary.xAxis.value, y: secondary.yAxis.value)
+		// Only the on/off facts go into the signature, so moving a finger does not flood the log.
+		let signature = "pressed=\(button.isPressed) touched=\(button.isTouched) value>0=\(button.value > 0) finger0=\(down0) finger1=\(down1)"
+		guard signature != lastTouchpadSignature else { return }
+		lastTouchpadSignature = signature
+		var live = ""
+		if #available(macOS 14.0, *), let element = g.controller?.input.buttons[GCInputDualShockTouchpadButton] {
+			live = " | live pressed=\(element.pressedInput.isPressed) value=\(element.pressedInput.value) touched=\(element.touchedInput.map { String($0.isTouched) } ?? "n/a")"
+		}
+		report("Touchpad: \(signature) value=\(button.value) pos0=(\(primary.xAxis.value), \(primary.yAxis.value))\(live)")
 	}
 
 	private func receiverChanged() {
