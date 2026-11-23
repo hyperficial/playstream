@@ -97,6 +97,15 @@ final class SelfTest {
 		expect(decoded?["ok"] as? Bool == true && result?["x"] is NSNull && result?["file"] as? String == "/tmp/a b" && (result?["when"] as? String)?.hasPrefix("1970-01-01") == true,
 		       "response encoding survives infinity, dates and URLs", String(decoding: encoded, as: UTF8.self))
 		expect(encoded.last == 0x0A && encoded.dropLast().firstIndex(of: 0x0A) == nil, "a response is exactly one line")
+		// Whatever a host puts into a result, encoding must neither fail nor raise.
+		let odd: [String: Any] = [
+			"set": Set([1, 2]), "object": NSObject(), "decimal": Decimal(1.5), "nested": ["nan": Float.nan, "deep": [Double.infinity, 1.0]] as [String: Any],
+			"tuple": (1, "a"), "data": Data([1, 2]), "optional": Optional<Int>.none as Any, "anyKeys": [1: "one"] as [Int: String], "text": "line\nbreak \u{1F600}",
+		]
+		let oddEncoded = ControlResponse.success(odd).encoded()
+		let oddDecoded = (try? JSONSerialization.jsonObject(with: oddEncoded) as? [String: Any])?["result"] as? [String: Any]
+		expect(oddDecoded?.count == odd.count && oddDecoded?["optional"] is NSNull && (oddDecoded?["nested"] as? [String: Any])?["nan"] is NSNull && oddEncoded.dropLast().firstIndex(of: 0x0A) == nil,
+		       "values JSON cannot hold (sets, objects, tuples, NaN, non-string keys) are converted, never a crash", String(decoding: oddEncoded, as: UTF8.self))
 	}
 
 	// MARK: - Settings
@@ -132,6 +141,16 @@ final class SelfTest {
 		let reset = try? SettingsCatalog.set("stream.upscaler", to: "default", in: defaults)
 		expect(reset?.newValue as? Int == 0 && defaults.object(forKey: "stream.upscaler") == nil, "\"default\" removes the stored value")
 		expect(SettingsCatalog.descriptor(for: "stream.bitrateMbps")?.applies == .nextConnection && SettingsCatalog.descriptor(for: "stream.upscaler")?.applies == .live, "live versus next-connection is recorded per setting")
+		// Values put into the store by hand, bypassing the checks, must never reach a computation raw.
+		defaults.set(1e30, forKey: "debug.flightRecorderSeconds")
+		defaults.set(-5, forKey: "debug.flightRecorderMegabytes")
+		defaults.set("abc", forKey: "stream.bitrateMbps")
+		defaults.set(45, forKey: "stream.fps")
+		defaults.set(Double.nan, forKey: "audio.volume")
+		expect(SettingsCatalog.double("debug.flightRecorderSeconds", in: defaults) == 600 && SettingsCatalog.int("debug.flightRecorderMegabytes", in: defaults) == 16
+			&& SettingsCatalog.double("stream.bitrateMbps", in: defaults) == 30 && SettingsCatalog.int("stream.fps", in: defaults) == 60 && SettingsCatalog.double("audio.volume", in: defaults) == 1,
+		       "hand-edited values outside the range are clamped, unusable ones replaced by the default")
+		for key in ["debug.flightRecorderSeconds", "debug.flightRecorderMegabytes", "stream.bitrateMbps", "stream.fps", "audio.volume"] { defaults.removeObject(forKey: key) }
 		let listing = SettingsCatalog.listing(defaults)
 		expect(listing.count == SettingsCatalog.all.count && listing.allSatisfy { $0["value"] != nil && $0["default"] != nil && $0["applies"] != nil }, "listing has value, default and applies for every setting")
 
@@ -401,7 +420,7 @@ final class SelfTest {
 			ResumeRecord(hostID: "AABBCCDDEEFF", hostName: "PS5", reason: reason, updatedAt: now.addingTimeInterval(-age), wasFullScreen: true, sessionEndedAt: endedAgo.map { now.addingTimeInterval(-$0) })
 		}
 		func decide(_ r: ResumeRecord?, enabled: Bool = true, account: Bool = true, registered: Bool = true, suppressed: Bool = false) -> ResumePolicy.Decision {
-			ResumePolicy.decide(record: r, enabled: enabled, now: now, windowSeconds: 900, hasAccount: account, hostIsRegistered: registered, suppressed: suppressed)
+			ResumePolicy.decide(record: r, enabled: enabled, now: now, windowSeconds: 300, hasAccount: account, hostIsRegistered: registered, suppressed: suppressed)
 		}
 		func resumes(_ d: ResumePolicy.Decision) -> Bool { if case .resume = d { return true }; return false }
 		func delay(_ d: ResumePolicy.Decision) -> TimeInterval? { if case .resume(_, let delay) = d { return delay }; return nil }
@@ -802,6 +821,20 @@ final class SelfTest {
 			expect(false, "dump with the recorder off fails")
 		}
 
+		// Limits and durations far outside anything sensible must not trap on the stream thread.
+		bounded.limits = .init(seconds: .infinity, bytes: .max)
+		bounded.keyframeIntervalSeconds = 1e300
+		bounded.keyframeWaitSeconds = .nan
+		for _ in 0..<20 { big.sendFrame() }
+		bounded.limits = .init(seconds: .nan, bytes: -1)
+		for _ in 0..<5 { big.sendFrame() }
+		bounded.limits = .init(seconds: 60, bytes: 8 << 20)
+		for _ in 0..<5 { big.sendFrame() }
+		let absurd = dump(bounded, seconds: 1e300, to: dir.appendingPathComponent("absurd.pscap"))
+		if case .success = absurd { expect(true, "absurd limits, intervals and durations (infinity, NaN, 1e300) are survived") } else { expect(false, "dump with an absurd duration", "\(absurd)") }
+		bounded.keyframeIntervalSeconds = 0
+		bounded.keyframeWaitSeconds = 2
+
 		// 5. Explicit capture to disk: starts with the keyframe it asked for.
 		let live = StreamCaptureTee(limits: .init(seconds: 60, bytes: 64 << 20))
 		let stream = SyntheticStream(bytesPerFrame: 20_000)
@@ -1077,6 +1110,10 @@ final class SelfTest {
 		let again = result(call("capture", ["stop"]))
 		expect(again["path"] as? String == stopped["path"] as? String && (again["note"] as? String ?? "").contains("no capture was running"), "capture stop with nothing running reports the last finished file and says so")
 		expect(error(call("capture", ["sideways"])).contains("usage"), "capture with a bad argument explains the usage")
+		let silly = [call("capture", ["inf"]), call("capture", ["nan"]), call("capture", ["start", "nan"]), call("capture", ["start", "1e300"]), call("trace", ["1e300"]),
+		             call("frames", ["1"], ["timeout": "nan"]), call("log", [], ["n": 1e300]), call("capture", [], ["seconds": "inf"]), call("tune", ["pacer.marginMs", "nan"])]
+		_ = call("capture", ["stop"])
+		expect(silly.allSatisfy { $0["ok"] != nil } && ok(call("ping")), "numbers that are infinite, not numbers or absurdly large get an answer, not a crash (\(silly.filter { ok($0) }.count) accepted, \(silly.filter { !ok($0) }.count) refused)")
 
 		// Log
 		let marked = result(call("mark", ["hello", "from", "selftest"]))
