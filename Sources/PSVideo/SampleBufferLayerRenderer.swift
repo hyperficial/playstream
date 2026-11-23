@@ -266,7 +266,10 @@ final class SampleBufferLayerRenderer: VideoRenderer {
 				s.framesDecoded = result.decoded
 				s.layerDroppedFrames = result.dropped
 				s.layerCorruptedFrames = result.corrupted
-				if let fps = result.fps { s.decodedFPS = fps }
+				if let fps = result.fps {
+					s.decodedFPS = fps
+					s.presentedFPS = fps // the layer's displayed-frame rate (best available on this path)
+				}
 			}
 		}
 	}

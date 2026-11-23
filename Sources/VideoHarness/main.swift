@@ -64,6 +64,7 @@ struct Options {
 	var qualityRef: String?
 	var upscaler: VideoUpscaler = .off
 	var outputSize: CGSize?
+	var sharpness = 0.5
 	var frameGen: VideoFrameGeneration = .off
 	var detectTruth: String?
 	var fgEval = false
@@ -123,6 +124,7 @@ while !args.isEmpty {
 	case "--fg-method": opt.fgMethod = VideoFrameGenerationMethod(rawValue: next()) ?? .extrapolate
 	case "--quality": opt.qualityRef = next()
 	case "--upscaler": opt.upscaler = VideoUpscaler(rawValue: next()) ?? .off
+	case "--sharpness": opt.sharpness = Double(next()) ?? 0.5
 	case "--frame-gen": opt.frameGen = VideoFrameGeneration(rawValue: next()) ?? .off
 	case "--detect-eval": opt.detectTruth = next()
 	case "--fg-eval": opt.fgEval = true
@@ -329,6 +331,7 @@ let pipeline = VideoPipeline(displayMode: opt.mode, pacingMode: opt.pacing)
 if let v = opt.minDelayMs { pipeline.minimumPlayoutDelayMs = v }
 if let v = opt.maxDelayMs { pipeline.maximumPlayoutDelayMs = v }
 pipeline.upscaler = opt.upscaler
+pipeline.upscalerSharpness = opt.sharpness
 pipeline.frameGenerationMethod = opt.fgMethod
 pipeline.frameGeneration = opt.frameGen
 let detectEval = opt.detectTruth.map { DetectEval(truthPath: $0) }
@@ -630,6 +633,9 @@ func describePacing(_ s: VideoStats) -> String {
 	if let g = s.renderGPUTimeAvgMs, let m = s.renderGPUTimeMaxMs { t += String(format: " gpu=%.2f/%.2fms", g, m) }
 	if let g = s.scalerGPUTimeAvgMs { t += String(format: " mfx=%.2fms", g) }
 	t += " rebases=\(s.pacerRebases)"
+	t += String(format: " presentedFPS=%.1f presentedRing=%d arrivalRing=%d", s.presentedFPS, s.recentPresentedIntervalsMs.count, s.recentArrivalIntervalsMs.count)
+	if let a = s.recentArrivalIntervalsMs.last { t += String(format: " lastArrival=%.1fms", a) }
+	if let p = s.frameTimeP99Ms, let m = s.frameTimeMaxMs { t += String(format: " frameTimeP99=%.1f max=%.1f", p, m) }
 	if s.frameGeneration != .off {
 		t += " method=\(s.frameGenerationMethod.rawValue) rejMotion=\(s.frameGenerationRejectedMotion)" + String(format: " motion=%.1fms warp=%.1fms", s.frameGenerationMotionMs, s.frameGenerationWarpMs)
 		t += String(format: " fg=%@/%@ content=%.0ffps gen=%.0f/s total=%d fallbacks=%d cuts=%d added=%.1fms interp=%.1fms convert=%.2fms guard=%.2fms shifts=%d lateReal=%d lateGen=%d", s.frameGeneration.rawValue, s.frameGenerationState, s.contentFPS, s.generatedFPS, s.framesGenerated, s.frameGenerationFallbacks, s.frameGenerationCutsSkipped, s.frameGenerationAddedLatencyMs, s.frameGenerationTimeMs, s.frameGenerationConvertMs, s.frameGenerationGuardMs, s.frameGenerationSlotShifts, s.frameGenerationLateReal, s.presentsLateGenerated)

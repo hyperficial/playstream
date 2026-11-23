@@ -62,6 +62,7 @@ final class StreamController: ObservableObject {
 		self.video = VideoPipeline(displayMode: wanted.display, pacingMode: wanted.pacing)
 		self.video.upscaler = wanted.upscaler
 		self.video.frameGeneration = wanted.frameGeneration
+		self.video.upscalerSharpness = settings.upscalerSharpness
 		self.video.frameGenerationMaxAddedLatencyMs = settings.frameGenerationMaxDelay
 		self.video.frameGenerationMethod = settings.frameGenerationMethod == 1 ? .interpolate : .extrapolate
 		// Adaptive jitter buffer: 40 ms on a clean link, growing by itself when the link stalls.
@@ -116,7 +117,7 @@ final class StreamController: ObservableObject {
 	/// generation only exist on the Metal path, and frame generation also needs pacing, so
 	/// turning either on implies those.
 	static func videoConfiguration(for settings: AppSettings) -> (display: VideoDisplayMode, pacing: VideoPacingMode, upscaler: VideoUpscaler, frameGeneration: VideoFrameGeneration) {
-		let upscaler: VideoUpscaler = [.off, .bicubic, .metalFXSpatial][min(max(settings.upscaler, 0), 2)]
+		let upscaler: VideoUpscaler = [.off, .bicubic, .metalFXSpatial, .fsr1][min(max(settings.upscaler, 0), 3)]
 		let frameGeneration: VideoFrameGeneration = [.off, .to60, .to120][min(max(settings.frameGeneration, 0), 2)]
 		let needsMetal = settings.lowLatencyRenderer || upscaler != .off || frameGeneration != .off
 		let pacing: VideoPacingMode = (settings.framePacing || frameGeneration != .off) ? .adaptive : .off
@@ -142,6 +143,10 @@ final class StreamController: ObservableObject {
 		if video.frameGeneration != wanted.frameGeneration {
 			video.frameGeneration = wanted.frameGeneration
 			changes.append("frame generation \(wanted.frameGeneration.rawValue)")
+		}
+		if video.upscalerSharpness != settings.upscalerSharpness {
+			video.upscalerSharpness = settings.upscalerSharpness
+			changes.append(String(format: "sharpness %.2f", settings.upscalerSharpness))
 		}
 		let method: VideoFrameGenerationMethod = settings.frameGenerationMethod == 1 ? .interpolate : .extrapolate
 		if video.frameGenerationMethod != method {
@@ -191,7 +196,9 @@ final class StreamController: ObservableObject {
 
 		// Pictures reaching the screen per second: real ones plus generated ones.
 		let generating = stats.video.frameGeneration != .off
-		let outputFPS = stats.video.decodedFPS + (generating ? stats.video.generatedFPS : 0)
+		let estimatedFPS = stats.video.decodedFPS + (generating ? stats.video.generatedFPS : 0)
+		// The pipeline counts pictures that really reached the screen; fall back to the estimate until it has data.
+		let outputFPS = stats.video.presentedFPS > 1 ? stats.video.presentedFPS : estimatedFPS
 		let nominalFrameTime = outputFPS > 1 ? 1000 / outputFPS : 0
 		history.append(StatsSample(
 			outputFPS: outputFPS,
@@ -215,7 +222,7 @@ final class StreamController: ObservableObject {
 			CoreLog.note(
 				"Present: drops kf \(v.dropsAwaitingKeyframe) dec \(v.dropsDecodeError) superseded \(v.dropsSuperseded) overflow \(v.dropsQueueOverflow) nodrawable \(v.dropsNoDrawable)"
 					+ " | ontime \(v.presentsOnTime) late1 \(v.presentsLate1) late2+ \(v.presentsLate2Plus) lategen \(v.presentsLateGenerated) notshown \(v.presentsNotShown) err \(ms(v.presentErrorAvgMs))/\(ms(v.presentErrorMaxMs)) ms commitahead \(ms(v.commitAheadMinMs)) ms"
-					+ " | refreshes \(v.presentedRefreshHistogram) offcadence \(v.presentedOffCadence) panel \(ms(v.displayRefreshHz)) Hz"
+					+ " | presented \(String(format: "%.0f", v.presentedFPS)) fps frametime p99 \(ms(v.frameTimeP99Ms)) max \(ms(v.frameTimeMaxMs)) ms refreshes \(v.presentedRefreshHistogram) offcadence \(v.presentedOffCadence) panel \(ms(v.displayRefreshHz)) Hz"
 					+ " | queue \(v.pacedQueueDepthMax) drawablewait \(ms(v.drawableWaitMaxMs)) ms glass \(ms(v.glassAvgMs)) ms"
 					+ " | upscaler \(v.activeUpscaler.rawValue) \(v.upscaleOutputWidth)x\(v.upscaleOutputHeight) gpu \(ms(v.renderGPUTimeAvgMs))/\(ms(v.renderGPUTimeMaxMs)) ms scaler \(ms(v.scalerGPUTimeAvgMs)) ms"
 					+ " | framegen \(v.frameGeneration.rawValue) \(v.frameGenerationMethod) state \(v.frameGenerationState) content \(String(format: "%.0f", v.contentFPS)) fps generated \(String(format: "%.0f", v.generatedFPS))/s total \(v.framesGenerated) fallbacks \(v.frameGenerationFallbacks) cuts \(v.frameGenerationCutsSkipped) hold \(ms(v.frameGenerationAddedLatencyMs))/\(ms(v.frameGenerationMaxAddedLatencyMs)) ms time \(ms(v.frameGenerationTimeMs)) ms convert \(ms(v.frameGenerationConvertMs)) ms guard \(ms(v.frameGenerationGuardMs)) ms slotshifts \(v.frameGenerationSlotShifts) latereal \(v.frameGenerationLateReal) rejectedmotion \(v.frameGenerationRejectedMotion) motion \(ms(v.frameGenerationMotionMs)) ms warp \(ms(v.frameGenerationWarpMs)) ms | pacer rebases \(v.pacerRebases)"

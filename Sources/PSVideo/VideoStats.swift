@@ -1,4 +1,5 @@
 import Foundation
+import QuartzCore
 import os
 import PSContracts
 
@@ -63,6 +64,21 @@ public struct VideoStats: Sendable, Equatable {
 	/// Current display EDR headroom (1.0 = SDR display or HDR not engaged).
 	public var edrHeadroom: Double = 1
 
+	// MARK: Overlay (FPS including generated pictures, frame times)
+
+	/// Pictures put on screen per second over the last second, real + generated. Metal path: counted from
+	/// the drawables' presented-time callbacks (what actually reached the glass). Layer path: the layer's
+	/// own displayed-frame rate from AVVideoPerformanceMetrics (frames it displayed, not glass timing).
+	public var presentedFPS: Double = 0
+	/// On-screen interval of each of the most recent pictures, ms, newest last, up to 240 entries
+	/// (Metal path, from presented times; empty on the layer path).
+	public var recentPresentedIntervalsMs: [Float] = []
+	/// Interval between consecutive frame arrivals from the network, ms, newest last, up to 240 (both paths).
+	public var recentArrivalIntervalsMs: [Float] = []
+	/// 99th percentile and maximum of the presented intervals over the last 5 s, ms (Metal path; nil otherwise).
+	public var frameTimeP99Ms: Double?
+	public var frameTimeMaxMs: Double?
+
 	// MARK: Pacing and network arrival (arrival figures cover the last 5 s)
 
 	public var pacingMode: VideoPacingMode = .adaptive
@@ -107,7 +123,7 @@ public struct VideoStats: Sendable, Equatable {
 	/// GPU time of all passes for one frame (conversion + scaling + copy), ms, last second.
 	public var renderGPUTimeAvgMs: Double?
 	public var renderGPUTimeMaxMs: Double?
-	/// GPU time of the MetalFX pass alone, ms, last second (nil unless MetalFX is active).
+	/// GPU time of the scaling pass alone (MetalFX, or FSR 1 EASU + RCAS), ms, last second (nil otherwise).
 	public var scalerGPUTimeAvgMs: Double?
 
 	// MARK: Frame generation (Metal path, paced)
@@ -201,7 +217,28 @@ final class StatsCollector: @unchecked Sendable {
 		var scalerSum = 0.0, scalerN = 0
 	}
 
+	/// Fixed-size ring of floats (no allocation after init).
+	struct FloatRing {
+		var buf: [Float]
+		var head = 0, count = 0
+		init(_ n: Int) { buf = [Float](repeating: 0, count: n) }
+		mutating func push(_ v: Float) {
+			buf[(head + count) % buf.count] = v
+			if count < buf.count { count += 1 } else { head = (head + 1) % buf.count }
+		}
+		func array() -> [Float] { (0..<count).map { buf[(head + $0) % buf.count] } }
+		mutating func clear() { head = 0; count = 0 }
+	}
+
 	private struct State {
+		var presented = FloatRing(240)
+		var arrivals = FloatRing(240)
+		/// Presented intervals with their time, for the 5 s frame-time percentile (~120 Hz x 5 s).
+		var frameTimes = FloatRing(720)
+		var frameTimeStamps = [Double](repeating: 0, count: 720)
+		var lastPresentedTime = 0.0
+		var presentedInWindow = 0
+		var presentedWindowStart = 0.0
 		var stats = VideoStats()
 		var window = Window()
 		var lastPublish: UInt64 = 0
@@ -227,6 +264,22 @@ final class StatsCollector: @unchecked Sendable {
 		lock.withLock { s in
 			var out = s.stats
 			out.framesDropped += out.layerDroppedFrames + out.layerCorruptedFrames
+			out.recentPresentedIntervalsMs = s.presented.array()
+			out.recentArrivalIntervalsMs = s.arrivals.array()
+			// Frame-time p99 / max over the last 5 s of presented intervals.
+			let now = CACurrentMediaTime()
+			var recent: [Float] = []
+			recent.reserveCapacity(s.frameTimes.count)
+			for i in 0..<s.frameTimes.count {
+				let idx = (s.frameTimes.head + i) % s.frameTimes.buf.count
+				if now - s.frameTimeStamps[idx] <= 5 { recent.append(s.frameTimes.buf[idx]) }
+			}
+			if !recent.isEmpty {
+				recent.sort()
+				out.frameTimeP99Ms = Double(recent[min(recent.count - 1, Int(Double(recent.count - 1) * 0.99))])
+				out.frameTimeMaxMs = Double(recent.last!)
+			}
+			if s.presentedWindowStart > 0 && now - s.presentedWindowStart > 2 { out.presentedFPS = 0 } // stalled
 			// No completed window for 2 s: the stream is stalled.
 			if !s.externalDecode && s.lastPublish != 0 && Self.ms(from: s.lastPublish, to: mach_absolute_time()) > 2000 {
 				out.decodedFPS = 0
@@ -353,6 +406,34 @@ final class StatsCollector: @unchecked Sendable {
 			s.window.depthMax = max(s.window.depthMax, queueDepth)
 			s.window.waitMax = max(s.window.waitMax, drawableWaitMs)
 		}
+	}
+
+	/// A picture reached the glass at host time `t` (Metal path, every presented drawable).
+	func presented(at t: Double) {
+		lock.withLock { s in
+			if s.lastPresentedTime > 0 && t > s.lastPresentedTime {
+				let ms = Float((t - s.lastPresentedTime) * 1000)
+				if ms < 1000 {
+					s.presented.push(ms)
+					let idx = (s.frameTimes.head + s.frameTimes.count) % s.frameTimes.buf.count
+					s.frameTimes.push(ms)
+					s.frameTimeStamps[idx] = t
+				}
+			}
+			s.lastPresentedTime = max(s.lastPresentedTime, t)
+			if s.presentedWindowStart == 0 { s.presentedWindowStart = t }
+			s.presentedInWindow += 1
+			if t - s.presentedWindowStart >= 1 {
+				s.stats.presentedFPS = Double(s.presentedInWindow) / (t - s.presentedWindowStart)
+				s.presentedInWindow = 0
+				s.presentedWindowStart = t
+			}
+		}
+	}
+
+	/// A frame arrived `ms` after the previous one (both paths).
+	func arrival(intervalMs ms: Double) {
+		lock.withLock { $0.arrivals.push(Float(ms)) }
 	}
 
 	func renderGPU(ms: Double) {

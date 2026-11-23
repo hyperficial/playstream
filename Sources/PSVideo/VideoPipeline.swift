@@ -56,6 +56,17 @@ public final class VideoPipeline: VideoStreamSink {
 	}
 	private var upscalerSetting: VideoUpscaler = .off
 
+	/// Sharpening strength 0...1 for upscalers with a sharpening stage (`.fsr1`: RCAS; 0 = no sharpening
+	/// pass, 1 = AMD's maximum). MetalFX spatial and bicubic have no sharpening control. Default 0.5.
+	/// Main thread, takes effect on the next frame.
+	public var upscalerSharpness: Double = 0.5 {
+		didSet {
+			dispatchPrecondition(condition: .onQueue(.main))
+			upscalerSharpness = min(1, max(0, upscalerSharpness))
+			(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.setSharpness(upscalerSharpness)
+		}
+	}
+
 	/// Frame generation (main thread). Default `.off`. Needs `displayMode == .metal` and
 	/// `pacingMode == .adaptive`; otherwise it is remembered but inactive (see `stats.frameGenerationState`).
 	public var frameGeneration: VideoFrameGeneration {
@@ -134,6 +145,7 @@ public final class VideoPipeline: VideoStreamSink {
 	private let pacer = FramePacer()
 	private let debugSubmit = ProcessInfo.processInfo.environment["PSVIDEO_DEBUG_FG"] != nil
 	private var lastCallEnd: UInt64 = 0
+	private var lastArrivalTicks: UInt64 = 0
 	private var lastPacerPublish: UInt64 = 0
 	private var lateFrames = 0
 	private var skippedFrames = 0
@@ -211,6 +223,8 @@ public final class VideoPipeline: VideoStreamSink {
 
 	public func videoStreamDidReceive(accessUnit: UnsafeRawBufferPointer, framesLost: Int, frameRecovered: Bool) -> Bool {
 		let arrival = mach_absolute_time()
+		if lastArrivalTicks != 0 { collector.arrival(intervalMs: StatsCollector.ms(from: lastArrivalTicks, to: arrival)) }
+		lastArrivalTicks = arrival
 		let r = streamLock.withLock { process(accessUnit, framesLost: framesLost, frameRecovered: frameRecovered, arrival: arrival) }
 		if debugSubmit {
 			let inside = StatsCollector.ms(from: arrival, to: mach_absolute_time())
@@ -423,6 +437,7 @@ public final class VideoPipeline: VideoStreamSink {
 		let new = Self.makeRenderer(mode, stats: collector)
 		new.setPacing(pacingMode)
 		new.setUpscaler(upscalerSetting)
+		(new as? MetalVideoRenderer)?.setSharpness(upscalerSharpness)
 		(new as? MetalVideoRenderer)?.setMaxAddedLatency(frameGenerationMaxAddedLatencyMs / 1000)
 		(new as? MetalVideoRenderer)?.setFrameGenerationMethod(frameGenerationMethod)
 		new.setFrameGeneration(frameGenerationSetting)
@@ -473,7 +488,7 @@ public final class VideoPipeline: VideoStreamSink {
 	/// Diagnostics: the last decoded picture through the Metal path's conversion + `upscaler` at
 	/// `outputSize`, rendered offscreen (rgba16Float, stream transfer domain), plus GPU time.
 	@_spi(Diagnostics)
-	public func renderLastFrameOffscreen(upscaler: VideoUpscaler, outputSize: CGSize?, hdrDomainLinear: Bool? = nil, readBack: Bool = true)
+	public func renderLastFrameOffscreen(upscaler: VideoUpscaler, outputSize: CGSize?, hdrDomainLinear: Bool? = nil, readBack: Bool = true, sharpness: Float? = nil)
 		-> (width: Int, height: Int, rgba: [Float16], gpuMs: Double, mode: VideoUpscaler)?
 	{
 		guard let r = rendererLock.withLock({ renderer }) as? MetalVideoRenderer,
@@ -481,7 +496,7 @@ public final class VideoPipeline: VideoStreamSink {
 		let c = colorInfo
 		return r.renderOffscreen(pb, matrix: c?.matrix ?? (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String), hdr: c?.isHDR ?? false,
 		                         upscaler: upscaler, outputSize: outputSize,
-		                         hdrDomain: hdrDomainLinear.map { $0 ? .linear : .pq }, readBack: readBack)
+		                         hdrDomain: hdrDomainLinear.map { $0 ? .linear : .pq }, readBack: readBack, sharpness: sharpness)
 	}
 
 	/// Diagnostics: interpolate the midpoint of two decoded pictures (frame generation's interpolator,

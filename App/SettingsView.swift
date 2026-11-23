@@ -39,6 +39,12 @@ struct SettingsView: View {
 					Text("Off").tag(0)
 					Text("Bicubic (neutral)").tag(1)
 					Text("MetalFX (sharpest)").tag(2)
+					Text("FSR 1 (adjustable)").tag(3)
+				}
+				if settings.upscaler == 3 {
+					LabeledContent("Sharpness") {
+						Slider(value: settings.$upscalerSharpness, in: 0...1)
+					}
 				}
 				Picker("Frame generation", selection: settings.$frameGeneration) {
 					Text("Off").tag(0)

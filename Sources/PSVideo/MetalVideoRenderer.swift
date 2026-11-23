@@ -318,6 +318,11 @@ final class MetalVideoRenderer: VideoRenderer {
 
 	// MARK: Upscaling
 
+	func setSharpness(_ v: Double) {
+		let s = Float(min(1, max(0, v)))
+		renderQueue.async { [weak self] in self?.scaler.sharpness = s }
+	}
+
 	func setUpscaler(_ u: VideoUpscaler) {
 		lock.withLock { shared.upscaler = u }
 		stats.update { $0.upscaler = u }
@@ -700,6 +705,7 @@ final class MetalVideoRenderer: VideoRenderer {
 				stats.presentNotShown()
 				return
 			}
+			stats.presented(at: t)
 			// Arrival-to-glass is about real pictures (a generated one carries the next picture's arrival).
 			if !generated { stats.onGlass(ms: (t - arrivalSeconds) * 1000) }
 			guard let self else { return }
@@ -809,7 +815,7 @@ final class MetalVideoRenderer: VideoRenderer {
 	/// Renders `pb` through the same conversion + scaling passes into an offscreen rgba16Float texture
 	/// of `outputSize` (video size if nil) and returns RGBA half floats (row-major), i.e. exactly what
 	/// would be presented, plus the GPU time of the passes. Uses its own scaler instance.
-	func renderOffscreen(_ pb: CVPixelBuffer, matrix: String, hdr: Bool, upscaler: VideoUpscaler = .off, outputSize: CGSize? = nil, hdrDomain: MetalFXHDRDomain? = nil, readBack: Bool = true)
+	func renderOffscreen(_ pb: CVPixelBuffer, matrix: String, hdr: Bool, upscaler: VideoUpscaler = .off, outputSize: CGSize? = nil, hdrDomain: MetalFXHDRDomain? = nil, readBack: Bool = true, sharpness: Float? = nil)
 		-> (width: Int, height: Int, rgba: [Float16], gpuMs: Double, mode: VideoUpscaler)?
 	{
 		let w = Int(outputSize?.width ?? CGFloat(CVPixelBufferGetWidth(pb)))
@@ -817,6 +823,7 @@ final class MetalVideoRenderer: VideoRenderer {
 		if offscreenScaler == nil { offscreenScaler = FrameScaler(device: device) }
 		guard let fs = offscreenScaler else { return nil }
 		if let d = hdrDomain, d != fs.hdrDomain { fs.hdrDomain = d; fs.releaseScaler() }
+		if let s = sharpness { fs.sharpness = s }
 		let key = "\(w)x\(h)"
 		if offscreenTarget?.label != key {
 			let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h, mipmapped: false)

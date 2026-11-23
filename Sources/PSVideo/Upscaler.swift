@@ -15,6 +15,9 @@ public enum VideoUpscaler: String, Sendable, CaseIterable, Codable {
 	/// MetalFX spatial upscaler (Apple's edge-adaptive scaler) to the display's pixel size.
 	/// Falls back to `.bicubic` if the device doesn't support MetalFX.
 	case metalFXSpatial
+	/// AMD FidelityFX Super Resolution 1: EASU edge-adaptive upscale + RCAS sharpening (MIT licence, ported
+	/// from AMD's source, see FSR1.swift). Sharpening strength: `VideoPipeline.upscalerSharpness`.
+	case fsr1
 }
 
 /// Which signal MetalFX sees for HDR. `.pq`: the PQ-encoded R'G'B' (a perceptual [0,1] signal) in
@@ -43,6 +46,11 @@ final class FrameScaler {
 	private var pipelines: [String: MTLRenderPipelineState] = [:]
 	let metalFXSupported: Bool
 	var hdrDomain: MetalFXHDRDomain = .linear
+	/// Sharpening for scalers with a sharpening stage (FSR 1 RCAS), 0...1. 0 = no sharpening pass.
+	var sharpness: Float = 0.5
+	private let fsrLibrary: MTLLibrary
+	private var fsrInput: MTLTexture?
+	private var fsrTemp: MTLTexture?
 
 	// MetalFX state, rebuilt when sizes / formats change.
 	private struct ScalerKey: Equatable {
@@ -65,6 +73,12 @@ final class FrameScaler {
 			return nil
 		}
 		metalFXSupported = MTLFXSpatialScalerDescriptor.supportsDevice(device)
+		do {
+			fsrLibrary = try device.makeLibrary(source: FSR1.shaderSource, options: nil)
+		} catch {
+			NSLog("[PSVideo] FSR1 shader compile failed: %@", "\(error)")
+			return nil
+		}
 		if let d = ProcessInfo.processInfo.environment["PSVIDEO_MFX_DOMAIN"], let v = MetalFXHDRDomain(rawValue: d) { hdrDomain = v }
 	}
 
@@ -72,8 +86,9 @@ final class FrameScaler {
 		let key = "\(fragment)/\(format.rawValue)"
 		if let p = pipelines[key] { return p }
 		let d = MTLRenderPipelineDescriptor()
-		d.vertexFunction = library.makeFunction(name: "psv_vertex")
-		d.fragmentFunction = library.makeFunction(name: fragment)
+		let lib = fragment.hasPrefix("fsr_") ? fsrLibrary : library
+		d.vertexFunction = lib.makeFunction(name: fragment.hasPrefix("fsr_") ? "fsr_vertex" : "psv_vertex")
+		d.fragmentFunction = lib.makeFunction(name: fragment)
 		d.colorAttachments[0].pixelFormat = format
 		guard let p = try? device.makeRenderPipelineState(descriptor: d) else { return nil }
 		pipelines[key] = p
@@ -102,6 +117,40 @@ final class FrameScaler {
 			else { return nil }
 			draw(cmd, pipeline: p, target: target, textures: [y, c], uniforms: uniforms)
 			return ([cmd], nil)
+
+		case .fsr1:
+			// FSR 1 works on perceptually encoded 0...1 signals (AMD: "after tonemapping"); RCAS's clip
+			// limiter assumes a peak of 1.0. PQ R'G'B' is such a signal, so HDR runs in the PQ domain and
+			// highlights stay where PQ puts them (no tone mapping, nothing clipped below PQ 1.0).
+			let w = target.width, h = target.height
+			if fsrInput?.width != y.width || fsrInput?.height != y.height {
+				let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: y.width, height: y.height, mipmapped: false)
+				d.usage = [.renderTarget, .shaderRead]
+				d.storageMode = .private
+				fsrInput = device.makeTexture(descriptor: d)
+			}
+			let sharpen = sharpness > 0.001
+			if sharpen && (fsrTemp?.width != w || fsrTemp?.height != h) {
+				let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h, mipmapped: false)
+				d.usage = [.renderTarget, .shaderRead]
+				d.storageMode = .private
+				fsrTemp = device.makeTexture(descriptor: d)
+			}
+			guard let input = fsrInput, let convert = queue.makeCommandBuffer(), let scale = queue.makeCommandBuffer(),
+			      let pConvert = pipeline("psv_fragment", input.pixelFormat),
+			      let pEasu = pipeline("fsr_easu", sharpen ? .rgba16Float : target.pixelFormat)
+			else { return nil }
+			var u = uniforms
+			u.flags = .zero
+			draw(convert, pipeline: pConvert, target: input, textures: [y, c], uniforms: u)
+			var k = FSR1.easuConstants(inputWidth: y.width, inputHeight: y.height, outputWidth: w, outputHeight: h)
+			let easuTarget = sharpen ? fsrTemp! : target
+			drawRaw(scale, pipeline: pEasu, target: easuTarget, textures: [input], bytes: &k, length: MemoryLayout<FSR1.EasuConstants>.stride)
+			if sharpen, let temp = fsrTemp, let pRcas = pipeline("fsr_rcas", target.pixelFormat) {
+				var con = FSR1.rcasSharpness(stops: (1 - min(1, sharpness)) * 2)
+				drawRaw(scale, pipeline: pRcas, target: target, textures: [temp], bytes: &con, length: 4)
+			}
+			return ([convert, scale], scale)
 
 		case .metalFXSpatial:
 			let linear = hdr && hdrDomain == .linear
@@ -166,6 +215,19 @@ final class FrameScaler {
 		intermediate = nil
 		scaled = nil
 		scalerKey = nil
+	}
+
+	private func drawRaw<T>(_ cmd: MTLCommandBuffer, pipeline: MTLRenderPipelineState, target: MTLTexture, textures: [MTLTexture], bytes: inout T, length: Int) {
+		let pass = MTLRenderPassDescriptor()
+		pass.colorAttachments[0].texture = target
+		pass.colorAttachments[0].loadAction = .dontCare
+		pass.colorAttachments[0].storeAction = .store
+		guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
+		enc.setRenderPipelineState(pipeline)
+		for (i, t) in textures.enumerated() { enc.setFragmentTexture(t, index: i) }
+		withUnsafeBytes(of: &bytes) { enc.setFragmentBytes($0.baseAddress!, length: length, index: 0) }
+		enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+		enc.endEncoding()
 	}
 
 	private func draw(_ cmd: MTLCommandBuffer, pipeline: MTLRenderPipelineState, target: MTLTexture, textures: [MTLTexture], uniforms: Uniforms) {

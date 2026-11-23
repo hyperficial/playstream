@@ -34,8 +34,10 @@ final class AppSettings: ObservableObject {
 	@AppStorage("controller.rumbleStrength") var rumbleStrength: Double = 1.0
 	@AppStorage("controller.motion") var motionSensors: Bool = true
 	@AppStorage("controller.keyboard") var keyboardFallback: Bool = true
-	/// 0 off, 1 bicubic, 2 MetalFX. Needs the Metal renderer; applies live.
+	/// 0 off, 1 bicubic, 2 MetalFX, 3 FSR 1. Needs the Metal renderer; applies live.
 	@AppStorage("stream.upscaler") var upscaler: Int = 0
+	/// 0 (none) ... 1 (strongest). Only FSR 1 has a sharpening stage. Applies live.
+	@AppStorage("stream.upscalerSharpness") var upscalerSharpness: Double = 0.5
 	/// 0 off, 1 fill 30 fps games up to 60, 2 double to 120 (experimental). Needs the Metal renderer and pacing; applies live.
 	@AppStorage("stream.frameGeneration") var frameGeneration: Int = 0
 	/// Most extra delay (ms) frame generation may add. Lower is more responsive but falls back to plain frames more often. Applies live.

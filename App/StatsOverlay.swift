@@ -43,14 +43,36 @@ struct StatsOverlay: View {
 	var body: some View {
 		VStack(alignment: .leading, spacing: 8) {
 			headline
-			graph(
-				title: "Frame time",
-				values: history.map(\.frameTimeMaxMs),
-				secondary: history.map(\.frameTimeMs),
-				reference: targetFrameTimeMs,
-				ceiling: targetFrameTimeMs * 3,
-				trailing: latest.map { String(format: "%.1f ms  worst %.1f", $0.frameTimeMs, $0.frameTimeMaxMs) } ?? "-"
-			)
+			if video.recentPresentedIntervalsMs.count > 8 {
+				// One point per picture actually shown: the real frame-time trace.
+				graph(
+					title: "Frame time (per frame)",
+					values: video.recentPresentedIntervalsMs.suffix(StreamController.historyLength).map(Double.init),
+					secondary: nil,
+					reference: targetFrameTimeMs,
+					ceiling: targetFrameTimeMs * 3,
+					trailing: String(format: "%.1f ms  99%% %.1f  worst %.1f", latest?.frameTimeMs ?? 0, video.frameTimeP99Ms ?? 0, video.frameTimeMaxMs ?? 0)
+				)
+			} else {
+				graph(
+					title: "Frame time",
+					values: history.map(\.frameTimeMaxMs),
+					secondary: history.map(\.frameTimeMs),
+					reference: targetFrameTimeMs,
+					ceiling: targetFrameTimeMs * 3,
+					trailing: latest.map { String(format: "%.1f ms  worst %.1f", $0.frameTimeMs, $0.frameTimeMaxMs) } ?? "-"
+				)
+			}
+			if level == .full, video.recentArrivalIntervalsMs.count > 8 {
+				graph(
+					title: "Network arrival (per frame)",
+					values: video.recentArrivalIntervalsMs.suffix(StreamController.historyLength).map(Double.init),
+					secondary: nil,
+					reference: 1000 / max(video.streamFPS, 1),
+					ceiling: 3000 / max(video.streamFPS, 1),
+					trailing: String(format: "longest gap %.0f ms", video.arrivalMaxGapMs)
+				)
+			}
 			if level == .full {
 				graph(
 					title: "Delay to screen",
@@ -110,7 +132,7 @@ struct StatsOverlay: View {
 		case .off: return "no upscaling"
 		case .bicubic: return "Bicubic"
 		case .metalFXSpatial: return "MetalFX"
-		default: return video.activeUpscaler.rawValue
+		case .fsr1: return "FSR 1"
 		}
 	}
 

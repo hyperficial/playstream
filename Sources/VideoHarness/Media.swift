@@ -324,21 +324,25 @@ func evaluateUpscaling(refPath: String, dumpDir: String?) {
 		return String(format: "; HDR highlights: %d ref px above SDR white, %.1f%% still above, mean PQ %.4f vs ref %.4f, peak %.4f vs %.4f",
 		              mask.count, Double(above) * 100 / Double(mask.count), sa / Double(mask.count), sr / Double(mask.count), Double(peakA), Double(peakR))
 	}
+	var fsrVariants: [Float] = []
 	var variants: [(String, VideoUpscaler, Bool?)] = [("off (bilinear, = compositor)", .off, nil), ("bicubic", .bicubic, nil), ("metalFXSpatial", .metalFXSpatial, false)]
 	if hdr { variants.append(("metalFXSpatial (linear-light HDR mode)", .metalFXSpatial, true)) }
+	for sh: Float in [0, 0.5, 0.8, 1.0] { fsrVariants.append(sh) }
 	log("upscaling 1920x1080 -> \(W)x\(H), \(hdr ? "HDR (PQ)" : "SDR"), reference = lanczos from the 6K source:")
-	for (name, mode, linear) in variants {
-		guard let first = pipeline.renderLastFrameOffscreen(upscaler: mode, outputSize: out, hdrDomainLinear: linear) else { log("  \(name): render failed"); continue }
+	var all: [(String, VideoUpscaler, Bool?, Float?)] = variants.map { ($0.0, $0.1, $0.2, nil) }
+	all += fsrVariants.map { ("fsr1 sharpness \($0)", .fsr1, nil, $0) }
+	for (name, mode, linear, sharp) in all {
+		guard let first = pipeline.renderLastFrameOffscreen(upscaler: mode, outputSize: out, hdrDomainLinear: linear, sharpness: sharp) else { log("  \(name): render failed"); continue }
 		// GPU time: warm, no read-back.
 		var t: [Double] = []
-		for _ in 0..<40 { if let r = pipeline.renderLastFrameOffscreen(upscaler: mode, outputSize: out, hdrDomainLinear: linear, readBack: false) { t.append(r.gpuMs) } }
+		for _ in 0..<40 { if let r = pipeline.renderLastFrameOffscreen(upscaler: mode, outputSize: out, hdrDomainLinear: linear, readBack: false, sharpness: sharp) { t.append(r.gpuMs) } }
 		t.sort()
 		let cropText = crops.map { String(format: "%@ %.2f", $0.name, psnr(first.rgba, rect: $0.rect)) }.joined(separator: ", ")
 			+ String(format: "; edge energy vs ref: text %.2f, landscape %.2f", edgeRatio(first.rgba, crops[0].rect), edgeRatio(first.rgba, crops[2].rect))
 		log(String(format: "  %@ [ran %@]: PSNR %.2f dB (%@); GPU %.2f ms median, %.2f p95%@", name, first.mode.rawValue, psnr(first.rgba), cropText,
 		           t[t.count / 2], t[min(t.count - 1, Int(Double(t.count) * 0.95))], highlight(first.rgba)))
 		if let dir = dumpDir {
-			let tag = name.split(separator: " ").first.map(String.init)! + (linear == true ? "-linear" : "")
+			let tag = name.split(separator: " ").first.map(String.init)! + (linear == true ? "-linear" : "") + (sharp.map { "-s\($0)" } ?? "")
 			dumpCrops(first.rgba, width: W, height: H, hdr: hdr, crops: crops.map { ($0.name, $0.rect) }, prefix: "\(dir)/\(hdr ? "hdr" : "sdr")_\(tag)")
 		}
 	}
