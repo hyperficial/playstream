@@ -34,7 +34,7 @@ final class DebugControl {
 			await MainActor.run { model?.stream?.videoDebug }
 		}
 		hooks.flightRecorder = { [weak model] in
-			await MainActor.run { model?.stream?.captureTee }
+			await MainActor.run { model?.flightRecorder }
 		}
 		hooks.applySettings = { [weak model] write in
 			// Store and apply in one step on the main thread, like the settings panel does. The

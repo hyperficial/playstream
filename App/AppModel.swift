@@ -93,6 +93,10 @@ final class AppModel: ObservableObject {
 	private var idleWait: IdleWait?
 	private var lastRelaunch: [String: Any]?
 	private var debugControl: DebugControl?
+	/// The flight recorder of the session that ended last, kept for a while so that what led up
+	/// to a dropped session can still be written out (`psctl capture`).
+	private var retiredRecorder: (tee: StreamCaptureTee, until: Date)?
+	private static let retiredRecorderSeconds: TimeInterval = 600
 	private var settingsFingerprint = ""
 	private var housekeeping: Timer?
 
@@ -176,6 +180,7 @@ final class AppModel: ObservableObject {
 		if let stream, stream.phase == .streaming, !isRelaunching, Date().timeIntervalSince(lastHeartbeat) >= 20 {
 			saveResumeRecord(for: stream, reason: .streaming)
 		}
+		if let retired = retiredRecorder, Date() > retired.until { retiredRecorder = nil }
 	}
 
 	// MARK: Connecting
@@ -310,7 +315,13 @@ final class AppModel: ObservableObject {
 		connectTask?.cancel()
 	}
 
+	/// The flight recorder `psctl capture` works on: the running session's, or for a few
+	/// minutes after a session ended, that session's.
+	var flightRecorder: StreamCaptureTee? { stream?.captureTee ?? retiredRecorder?.tee }
+
 	private func sessionIsStreaming(_ controller: StreamController, plan: ConnectPlan) {
+		// The new session's recorder takes over; the old one's memory is released.
+		retiredRecorder = nil
 		if plan.origin != .user || plan.attempt > 1 {
 			CoreLog.note("Connect (\(plan.origin.rawValue)): streaming again after \(plan.attempt) attempt\(plan.attempt == 1 ? "" : "s")")
 		}
@@ -328,6 +339,12 @@ final class AppModel: ObservableObject {
 			return
 		}
 		stream = nil
+		if controller.everStreamed {
+			retiredRecorder = (controller.captureTee, Date().addingTimeInterval(AppModel.retiredRecorderSeconds))
+			if isError, case .none = intent {
+				CoreLog.note("The flight recorder keeps the end of this session for \(Int(AppModel.retiredRecorderSeconds / 60)) minutes: `psctl capture` writes it out")
+			}
+		}
 
 		switch intent {
 		case .handover:

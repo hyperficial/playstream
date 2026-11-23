@@ -320,7 +320,7 @@ public final class ControlRouter: @unchecked Sendable {
 	private func capture(_ request: ControlRequest) async throws -> Any {
 		let first = request.arg(0)?.lowercased()
 		guard let tee = await hooks.flightRecorder() else {
-			throw ControlError(await hooks.sessionActive() ? "this session has no flight recorder" : "no session is running")
+			throw ControlError(await hooks.sessionActive() ? "this session has no flight recorder" : "no session is running (and none ended recently enough to still have its flight recorder)")
 		}
 		let limit = diskLimit
 		switch first {
