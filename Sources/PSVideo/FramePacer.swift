@@ -12,6 +12,12 @@ struct FrameSchedule {
 	var interval = 1.0 / 60
 	/// Frames were lost / repaired just before this one (frame generation must not bridge it).
 	var discontinuity = false
+	/// Best-case arrival grid time of this frame (base + k*T), host seconds.
+	var grid = 0.0
+	/// Raw jitter allowance (high percentile of lateness + margin, not clamped to the minimum delay), s.
+	var jitter = 0.0
+	/// Delay the pacer applies (target - grid), s.
+	var pacerDelay = 0.0
 	static let immediate = FrameSchedule(target: nil, skip: false)
 }
 
@@ -104,7 +110,7 @@ final class FramePacer {
 			targetDelay = minDelay
 			offsets.push(a, limit: analysisFrames)
 			lateness.push(0, limit: analysisFrames)
-			return FrameSchedule(target: a + delay, skip: false, late: false, interval: interval)
+			return FrameSchedule(target: a + delay, skip: false, late: false, interval: interval, grid: a, jitter: margin, pacerDelay: delay)
 		}
 
 		// Arrival statistics.
@@ -154,8 +160,9 @@ final class FramePacer {
 			skip = true
 			delay -= interval
 		}
-		let target = max(a, base + Double(k) * interval + delay)
-		return FrameSchedule(target: target, skip: skip, late: isLate, interval: interval)
+		let grid = base + Double(k) * interval
+		let target = max(a, grid + delay)
+		return FrameSchedule(target: target, skip: skip, late: isLate, interval: interval, grid: grid, jitter: min(p, maxDelay), pacerDelay: target - grid)
 	}
 
 	/// The console can drop to a lower frame rate (e.g. 30 fps); the grid must follow at once or

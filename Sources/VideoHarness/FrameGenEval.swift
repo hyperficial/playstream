@@ -48,6 +48,7 @@ final class InterpEval {
 	private let dump: String?
 	private var dumped = Set<Int>()
 	private var maxHistNormal: Float = 0
+	private var halfStats: [(psnr: Double, ms: Double, sharpHalf: Double, sharpFull: Double)] = []
 
 	init(dumpDir: String?) { dump = dumpDir }
 
@@ -79,6 +80,21 @@ final class InterpEval {
 				}
 			}
 			return 10 * log10(1 / max(1e-12, se / Double(n)))
+		}
+		// Reduced-resolution interpolation (960x540), scaled back: quality and sharpness vs full res.
+		if let (half, hms) = pipeline.interpolateScaledOffscreen(prev: a, next: b, width: 960, height: 540),
+		   let rh = pipeline.renderOffscreen(pixelBuffer: half) {
+			func edge(_ x: [Float16]) -> Double {
+				var e = 0.0
+				for yy in stride(from: 200, to: 900, by: 2) {
+					for xx in stride(from: 200, to: 1700, by: 2) {
+						let i = (yy * W + xx) * 4
+						e += abs(Double(x[i + 4]) - Double(x[i])) + abs(Double(x[i + W * 4]) - Double(x[i]))
+					}
+				}
+				return e
+			}
+			halfStats.append((psnr(rh.rgba, rt.rgba), hms, edge(rh.rgba) / max(1e-9, edge(rt.rgba)), edge(rg.rgba) / max(1e-9, edge(rt.rgba))))
 		}
 		let hud = (1580, 0, 340, 400)   // minimap with moving marker + timer (top-right)
 		let pan = (300, 300, 1200, 500) // panning background
@@ -117,6 +133,12 @@ final class InterpEval {
 		log(String(format: "  panning background: generated %.2f dB | repeat %.2f dB", avg { $0.genPan }, avg { $0.repPan }))
 		log(String(format: "  worst pair: generated %.2f dB (k=%d)", results.map { $0.gen }.min()!, results.min { $0.gen < $1.gen }!.k))
 		log(String(format: "  interpolation time incl. 8-bit conversion: median %.2f ms, max %.2f ms", ms[ms.count / 2], ms.last!))
+		if !halfStats.isEmpty {
+			let n = Double(halfStats.count)
+			let t = halfStats.map { $0.ms }.sorted()
+			log(String(format: "  960x540 interpolation (scaled back): %.2f dB vs truth (full res above), %.2f ms median; sharpness vs the real frame: half-res %.2f, full-res %.2f",
+			           halfStats.map { $0.psnr }.reduce(0, +) / n, t[t.count / 2], halfStats.map { $0.sharpHalf }.reduce(0, +) / n, halfStats.map { $0.sharpFull }.reduce(0, +) / n))
+		}
 		if !cutReport.isEmpty { log("  scene cut:" + cutReport + String(format: " largest histogram distance between normal pan pairs %.2f", maxHistNormal)) }
 	}
 }
@@ -146,7 +168,7 @@ func summarizeGeneration(_ log_: DisplayLog, truth: [Bool], phases: [(String, In
 		for e in sel {
 			if e.target < lastT { outOfOrder += 1 }
 			lastT = e.target
-			let slot = Int((e.target / refresh).rounded(.up))
+			let slot = Int((e.target / refresh).rounded())
 			if let p = prevSlot { hist[min(7, max(0, slot - p))] += 1; n += 1 }
 			prevSlot = slot
 		}

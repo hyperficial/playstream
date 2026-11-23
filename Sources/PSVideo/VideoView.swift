@@ -64,7 +64,10 @@ public final class VideoView: NSView {
 		rootLayer.setNeedsLayout()
 	}
 
-	@objc private func refreshTick(_ link: CADisplayLink) {}
+	@objc private func refreshTick(_ link: CADisplayLink) {
+		// Vsync phase and period for frame generation's slot clock.
+		pipeline.vsyncTick(timestamp: link.targetTimestamp, period: link.targetTimestamp - link.timestamp)
+	}
 
 	private func applyRefreshRange() {
 		let hz = Float(window?.screen?.maximumFramesPerSecond ?? 120)

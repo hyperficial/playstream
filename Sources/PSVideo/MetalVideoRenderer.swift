@@ -80,6 +80,9 @@ final class MetalVideoRenderer: VideoRenderer {
 		// Frame generation.
 		var frameGeneration: VideoFrameGeneration = .off
 		var errorSinceLastFrame = false
+		/// Display vsync (from the view's display link): last vsync time and period.
+		var vsyncPhase = 0.0
+		var vsyncPeriod = 0.0
 	}
 
 	struct PacedFrame {
@@ -89,6 +92,7 @@ final class MetalVideoRenderer: VideoRenderer {
 		var interval: Double
 		var refresh: Double
 		var config: RenderConfig
+		var generated = false
 	}
 
 	struct Scheduled {
@@ -97,6 +101,9 @@ final class MetalVideoRenderer: VideoRenderer {
 		var skip: Bool
 		var interval: Double
 		var discontinuity = false
+		var grid = 0.0
+		var jitter = 0.0
+		var pacerDelay = 0.0
 	}
 
 
@@ -164,10 +171,34 @@ final class MetalVideoRenderer: VideoRenderer {
 	var decodedFrameObserver: ((CVPixelBuffer) -> Void)?
 	var displayObserver: ((GeneratedEmit.Kind, Double, Int) -> Void)?
 
+	func setVsync(timestamp: Double, period: Double) {
+		lock.withLock {
+			shared.vsyncPhase = timestamp
+			shared.vsyncPeriod = period
+			if period > 0.002 { shared.refresh = period }
+		}
+	}
+
+	func setMaxAddedLatency(_ seconds: Double) {
+		maxAddedLatency = seconds
+		generator?.maxAddedLatency = seconds
+	}
+	private var maxAddedLatency = 0.040
+
+	private func makeGenerator() -> FrameGenerator? {
+		let g = FrameGenerator(device: device, stats: stats)
+		g?.emit = { [weak self] e in self?.enqueue(e) }
+		g?.vsync = { [weak self] in
+			guard let self else { return nil }
+			return self.lock.withLock { self.shared.vsyncPeriod > 0 ? (self.shared.vsyncPhase, self.shared.vsyncPeriod) : nil }
+		}
+		g?.maxAddedLatency = maxAddedLatency
+		return g
+	}
+
 	func setFrameGeneration(_ m: VideoFrameGeneration) {
 		if m != .off && generator == nil {
-			generator = FrameGenerator(device: device, stats: stats)
-			generator?.emit = { [weak self] e in self?.enqueue(e) }
+			generator = makeGenerator()
 			if generator == nil { NSLog("[PSVideo] frame generation unavailable on this system") }
 		}
 		lock.withLock { shared.frameGeneration = generator == nil ? .off : m }
@@ -178,17 +209,18 @@ final class MetalVideoRenderer: VideoRenderer {
 	/// A picture from the generator (real, generated or fallback) -> display queue.
 	private func enqueue(_ e: GeneratedEmit) {
 		let (refresh, config) = lock.withLock { (shared.refresh, shared.config) }
-		appendPaced(PacedFrame(buffer: e.buffer, arrival: e.arrival, at: e.target + Self.presentLead(refresh), interval: e.interval, refresh: refresh, config: config))
+		appendPaced(PacedFrame(buffer: e.buffer, arrival: e.arrival, at: e.presentAt ?? (e.target + Self.presentLead(refresh)), interval: e.interval,
+		                       refresh: refresh, config: config, generated: e.kind == .generated))
 		displayObserver?(e.kind, e.target, e.sourceIndex)
 	}
 
 	// MARK: Paced presentation
 
-	/// Fixed presentation lead: a frame is requested for `target + refresh / 2`. `present(atTime:)` shows
-	/// a drawable at the first vsync at or after the requested time, i.e. within
-	/// [target + refresh/2, target + 3*refresh/2): the vsync nearest `target + 1 refresh`. Constant by
-	/// construction, no feedback loop: on average one refresh (8.3 ms at 120 Hz) from target to glass.
-	static func presentLead(_ refresh: Double) -> Double { 0.5 * refresh }
+	/// Presentation lead for paced frames without a slot clock: a frame is requested for its target;
+	/// `present(atTime:)` shows it at the first vsync at or after that, so on average half a refresh
+	/// later. No feedback loop. (Was +half a refresh: that only added latency, the commit slack was
+	/// already ample: target - commit >= playout delay - decode - render ~ 11 ms.)
+	static func presentLead(_ refresh: Double) -> Double { 0 }
 
 	/// How long before its requested time a paced frame is rendered and committed: two refreshes + 4 ms
 	/// (~20.7 ms at 120 Hz) so the compositor always has more than it needs, while keeping only ~2
@@ -244,7 +276,7 @@ final class MetalVideoRenderer: VideoRenderer {
 				}
 				let depth = lock.withLock { shared.pacedQueue.count }
 				stats.pacedCommit(aheadMs: (f.at - CACurrentMediaTime()) * 1000, queueDepth: depth, drawableWaitMs: waited)
-				render(f.buffer, arrival: f.arrival, config: f.config, plan: plan, drawable: drawable, interval: f.interval, refresh: f.refresh, presentAt: f.at)
+				render(f.buffer, arrival: f.arrival, config: f.config, plan: plan, drawable: drawable, interval: f.interval, refresh: f.refresh, presentAt: f.at, generated: f.generated)
 				continue
 			}
 			if let w = wakeAt {
@@ -256,18 +288,17 @@ final class MetalVideoRenderer: VideoRenderer {
 
 	/// Diagnostics.
 	func interpolateNow(prev: CVPixelBuffer, next: CVPixelBuffer) -> (CVPixelBuffer, Double)? {
-		if generator == nil {
-			generator = FrameGenerator(device: device, stats: stats)
-			generator?.emit = { [weak self] e in self?.enqueue(e) }
-		}
+		if generator == nil { generator = makeGenerator() }
 		return generator?.interpolateNow(prev: prev, next: next)
 	}
 
+	func interpolateScaledNow(prev: CVPixelBuffer, next: CVPixelBuffer, width: Int, height: Int) -> (CVPixelBuffer, Double)? {
+		if generator == nil { generator = makeGenerator() }
+		return generator?.interpolateScaledNow(prev: prev, next: next, width: width, height: height)
+	}
+
 	func analyzeNow(_ pb: CVPixelBuffer, previous: CVPixelBuffer?) -> (changed: Float, hist: [Float])? {
-		if generator == nil {
-			generator = FrameGenerator(device: device, stats: stats)
-			generator?.emit = { [weak self] e in self?.enqueue(e) }
-		}
+		if generator == nil { generator = makeGenerator() }
 		return generator?.analyzeNow(pb, previous: previous)
 	}
 
@@ -379,7 +410,7 @@ final class MetalVideoRenderer: VideoRenderer {
 			let pts = CMSampleBufferGetPresentationTimeStamp(sample)
 			let key = pts.isValid ? CMClockConvertHostTimeToSystemUnits(pts) : arrival
 			lock.withLock {
-				shared.schedules.append(Scheduled(arrival: key, target: schedule.target, skip: schedule.skip, interval: schedule.interval, discontinuity: schedule.discontinuity))
+				shared.schedules.append(Scheduled(arrival: key, target: schedule.target, skip: schedule.skip, interval: schedule.interval, discontinuity: schedule.discontinuity, grid: schedule.grid, jitter: schedule.jitter, pacerDelay: schedule.pacerDelay))
 				if shared.schedules.count > 32 { shared.schedules.removeFirst(shared.schedules.count - 32) }
 			}
 			var info = VTDecodeInfoFlags()
@@ -534,7 +565,8 @@ final class MetalVideoRenderer: VideoRenderer {
 				shared.consecutiveErrors = 0
 				let disc = sc.discontinuity || shared.errorSinceLastFrame
 				shared.errorSinceLastFrame = false
-				return FrameGenerator.Input(buffer: image, arrival: arrival, target: target, interval: sc.interval, skip: sc.skip, discontinuity: disc)
+				return FrameGenerator.Input(buffer: image, arrival: arrival, target: target, interval: sc.interval, skip: sc.skip, discontinuity: disc,
+				                            grid: sc.grid, jitter: sc.jitter, pacerDelay: sc.pacerDelay)
 			}
 			if let input {
 				gen.submit(input)
@@ -628,7 +660,7 @@ final class MetalVideoRenderer: VideoRenderer {
 
 	/// Draws `pb` into `drawable` and presents it. `interval`/`refresh` are set on the paced path for
 	/// cadence statistics.
-	private func render(_ pb: CVPixelBuffer, arrival: UInt64, config: RenderConfig, plan: Plan, drawable: CAMetalDrawable, interval: Double?, refresh: Double?, presentAt: Double?) {
+	private func render(_ pb: CVPixelBuffer, arrival: UInt64, config: RenderConfig, plan: Plan, drawable: CAMetalDrawable, interval: Double?, refresh: Double?, presentAt: Double?, generated: Bool = false) {
 		guard let (yTex, cTex, uniforms) = makeTextures(pb, matrix: config.matrix),
 		      let y = CVMetalTextureGetTexture(yTex), let c = CVMetalTextureGetTexture(cTex),
 		      let encoded = scaler.encode(queue: commandQueue, y: y, c: c, uniforms: uniforms, mode: plan.mode, hdr: config.hdr, target: drawable.texture),
@@ -654,12 +686,13 @@ final class MetalVideoRenderer: VideoRenderer {
 				stats.presentNotShown()
 				return
 			}
-			stats.onGlass(ms: (t - arrivalSeconds) * 1000)
+			// Arrival-to-glass is about real pictures (a generated one carries the next picture's arrival).
+			if !generated { stats.onGlass(ms: (t - arrivalSeconds) * 1000) }
 			guard let self else { return }
 			self.presentedObserver?(t, arrivalSeconds)
 			guard let interval, let refresh else { return }
 			// Diagnostics only (never fed back): how far after the requested time the frame was shown.
-			if let at = presentAt { stats.presentTiming(errorMs: (t - at) * 1000, refresh: refresh) }
+			if let at = presentAt { stats.presentTiming(errorMs: (t - at) * 1000, refresh: refresh, generated: generated) }
 			let last: Double = self.lock.withLock {
 				let l = self.shared.lastPresentedTime
 				self.shared.lastPresentedTime = t

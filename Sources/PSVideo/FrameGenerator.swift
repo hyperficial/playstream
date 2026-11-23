@@ -28,6 +28,8 @@ struct GeneratedEmit {
 	var kind: Kind
 	/// Decode-order index of the stream picture this shows (generated: the slot it fills).
 	var sourceIndex: Int
+	/// Exact requested presentation time (slot clock); nil = renderer derives it from `target`.
+	var presentAt: Double? = nil
 }
 
 /// Runs on its own serial queue. Feed decoded frames in decode order with `submit`; pictures come out
@@ -42,7 +44,17 @@ final class FrameGenerator {
 		var skip: Bool
 		/// Frames lost / repaired / decode error just before this one: never interpolate across it.
 		var discontinuity: Bool
+		/// From the pacer: best-case arrival grid time, raw jitter allowance, applied pacer delay.
+		var grid: Double = 0
+		var jitter: Double = 0
+		var pacerDelay: Double = 0
 	}
+
+	/// Display vsync phase and period (from the view's display link); nil when unknown (headless).
+	var vsync: (() -> (phase: Double, period: Double)?)?
+	/// Most extra delay over the non-generating paced path the generator may use. Below what the
+	/// interpolation needs, more in-between pictures miss their slot and fall back.
+	var maxAddedLatency = 0.040
 
 	var emit: ((GeneratedEmit) -> Void)?
 	private let queue = DispatchQueue(label: "PSVideo.framegen", qos: .userInteractive)
@@ -89,9 +101,25 @@ final class FrameGenerator {
 	private var cadence: Cadence = .native
 	private(set) var contentFPS: Double = 0
 
-	// Latency hold for generation.
-	private var extraDelay = 0.0
+	// Slot clock (generating only): output pictures sit on consecutive vsync-aligned slots.
+	private struct Clock {
+		var anchorGrid: Double     // grid time of output slot 0
+		var anchorDisplay: Double  // vsync time at which output slot 0 is shown
+		var periodOut: Double      // output picture period in grid time (stream interval, or half of it when doubling)
+		var slotDur: Double        // whole refreshes per output picture
+		var refresh: Double
+		var windowStart: Double
+		var minSlack: Double       // smallest commit slack seen in the window (s)
+		var missed: Bool           // a slot was missed in the window
+	}
+	private var clock: Clock?
+	private var slotShifts = 0
+	private var lateReal = 0
+	private var addedLatency = 0.0
 	private var procTimes = Ring(capacity: 64)
+	private var convertMs = 0.0, guardMs = 0.0
+	/// Commit margin before a slot's vsync: render (+ upscale) GPU time and the compositor's own lead.
+	let commitMargin = 0.012
 	private var procScratch = [Double](repeating: 0, count: 64)
 
 	/// Output queue in presentation order. Real pictures are ready at once; an in-between slot waits for
@@ -108,6 +136,7 @@ final class FrameGenerator {
 		var interval: Double
 		var index: Int
 		var started = false
+		var presentAt: Double?
 		init(isGen: Bool, emit: GeneratedEmit?, target: Double, interval: Double, index: Int) {
 			self.isGen = isGen
 			self.emit = emit
@@ -166,7 +195,7 @@ final class FrameGenerator {
 			if m == .off {
 				self.flushSlots()
 				self.cadence = .native
-				self.extraDelay = 0
+				self.clock = nil
 				self.processor?.endSession()
 				self.processor = nil
 			}
@@ -181,7 +210,10 @@ final class FrameGenerator {
 			self.lastNew = nil
 			self.history.removeAll()
 			self.cadence = .native
-			self.extraDelay = 0
+			self.clock = nil
+			self.contentFPS = 0
+			self.stoppedState = true
+			self.publish()
 		}
 	}
 
@@ -218,15 +250,10 @@ final class FrameGenerator {
 		if history.count > 30 { history.removeFirst(history.count - 30) }
 		updateCadence(streamInterval: input.interval)
 
-		// 3. Hold time while generating: one stream interval (wait for the next picture) + p95 processing + margin.
+		// 3. Slot clock while generating; none otherwise (pictures keep the pacer's targets).
+		stoppedState = false
 		let generating = cadence != .native && processor != nil
-		let proc = procTimes.count > 4 ? procTimes.percentile(0.95, scratch: &procScratch) : 0.012
-		let wanted = generating ? input.interval + proc + 0.003 : 0
-		if wanted > extraDelay {
-			extraDelay = wanted
-		} else if wanted < extraDelay {
-			extraDelay -= min(extraDelay - wanted, 0.10 * input.interval) // slightly shortened intervals, no jump
-		}
+		if generating { updateClock(input) } else { clock = nil; addedLatency = 0 }
 
 		if input.skip {
 			// Pacer catch-up: keep as reference, don't show.
@@ -246,7 +273,7 @@ final class FrameGenerator {
 				fallBack(w)
 				appendReal(input, index: idx)
 			} else if cadence == .fillRepeats && generating, let prev = lastNew {
-				appendGen(prev: prev, fallback: input, target: input.target, interval: input.interval, index: idx)
+				appendGen(prev: prev, fallback: input, slot: slotIndex(input.grid), index: idx)
 			} else {
 				appendReal(input, index: idx)
 			}
@@ -259,9 +286,12 @@ final class FrameGenerator {
 		if generating { pic.buffer8 = to8bit(input.buffer) }
 		let isCut = lastNew.map { histDistance($0.hist, hist) > cutHistDistance } ?? true
 		if cadence == .doubling && generating, let prev = lastNew, prev.index == lastPicture?.index {
-			// Gap between two consecutive new pictures (30 fps stream, or 60 -> 120).
-			appendGen(prev: prev, fallback: nil, target: (prev.input.target + input.target) / 2,
-			          interval: (input.target - prev.input.target) / 2, index: idx)
+			// Gap between two consecutive new pictures (30 fps stream, or 60 -> 120): the slot just
+			// before this picture's. If frames were lost in between there is no single gap slot.
+			let o = slotIndex(input.grid)
+			if o - slotIndex(prev.input.grid) == 2 {
+				appendGen(prev: prev, fallback: nil, slot: o - 1, index: idx)
+			}
 		}
 		for slot in slots where slot.isGen && !slot.done && slot.next == nil {
 			if isCut || input.discontinuity {
@@ -278,20 +308,118 @@ final class FrameGenerator {
 		drain()
 	}
 
-	private func appendReal(_ i: Input, index: Int) {
-		let e = GeneratedEmit(buffer: i.buffer, arrival: i.arrival, target: i.target + extraDelay, interval: i.interval, kind: .real, sourceIndex: index)
-		slots.append(Slot(isGen: false, emit: e, target: e.target, interval: i.interval, index: index))
+	// MARK: Slot clock
+
+	/// Output slot of a grid time.
+	private func slotIndex(_ grid: Double) -> Int {
+		guard let c = clock else { return 0 }
+		return Int(((grid - c.anchorGrid) / c.periodOut).rounded())
 	}
 
-	private func appendGen(prev: Picture, fallback: Input?, target: Double, interval: Double, index: Int) {
-		let slot = Slot(isGen: true, emit: nil, target: target + extraDelay, interval: interval, index: index)
+	/// Vsync time at which output slot `o` is shown.
+	private func displayTime(_ o: Int) -> Double {
+		guard let c = clock else { return 0 }
+		return c.anchorDisplay + Double(o) * c.slotDur
+	}
+
+	private func vsyncInfo(fallbackRefresh: Double) -> (phase: Double, period: Double) {
+		if let v = vsync?(), v.period > 0.002 { return v }
+		return (0, fallbackRefresh)
+	}
+
+	private static func alignUp(_ t: Double, phase: Double, period: Double) -> Double {
+		phase + (((t - phase) / period) - 1e-6).rounded(.up) * period
+	}
+
+	/// The delay (after the grid time) at which a real picture must be shown so the in-between picture
+	/// before the next real one can be ready: jitter allowance (shared with pacing, not stacked) + half a
+	/// content interval (= one output period) + interpolation time + commit margin. Capped so the added
+	/// latency over the non-generating path stays within `maxAddedLatency`.
+	private func neededDelay(_ i: Input, periodOut: Double) -> Double {
+		let proc = procTimes.count > 4 ? procTimes.percentile(0.95, scratch: &procScratch) : 0.012
+		let need = i.jitter + periodOut + proc + commitMargin
+		let nonGenerating = i.pacerDelay
+		return min(need, nonGenerating + maxAddedLatency)
+	}
+
+	/// Keeps the clock: created on entering generation, moved only in whole output slots — later at once
+	/// when a real picture would miss its slot, earlier after 6 s with more than a slot of spare time.
+	private func updateClock(_ i: Input) {
+		let now = CACurrentMediaTime()
+		let periodOut = cadence == .doubling ? i.interval / 2 : i.interval
+		let v = vsyncInfo(fallbackRefresh: clock?.refresh ?? (1.0 / 120))
+		let slotDur = max(1, (periodOut / v.period).rounded()) * v.period
+		if clock == nil || abs(clock!.periodOut - periodOut) > 0.0005 || abs(clock!.slotDur - slotDur) > 0.0005 {
+			let display = Self.alignUp(i.grid + neededDelay(i, periodOut: periodOut), phase: v.phase, period: v.period)
+			clock = Clock(anchorGrid: i.grid, anchorDisplay: display, periodOut: periodOut, slotDur: slotDur, refresh: v.period,
+			              windowStart: now, minSlack: .infinity, missed: false)
+		}
+		guard var c = clock else { return }
+		let o = slotIndex(i.grid)
+		let slack = displayTime(o) - commitMargin - now
+		if slack < 0 {
+			// This real picture would miss its slot: move the whole grid later by whole slots.
+			let n = (-slack / c.slotDur).rounded(.up)
+			c.anchorDisplay += n * c.slotDur
+			c.missed = true
+			lateReal += 1
+			slotShifts += 1
+			c.windowStart = now
+			c.minSlack = .infinity
+		} else {
+			c.minSlack = min(c.minSlack, slack)
+		}
+		// Latency over budget, or comfortable for 3 s: one slot earlier.
+		let delay = c.anchorDisplay + Double(o) * c.slotDur - i.grid
+		let overBudget = delay - i.pacerDelay > maxAddedLatency + c.slotDur * 0.5
+		if now - c.windowStart > 6 || overBudget {
+			if overBudget || (!c.missed && c.minSlack > c.slotDur + 0.002) {
+				c.anchorDisplay -= c.slotDur
+				slotShifts += 1
+			}
+			c.windowStart = now
+			c.minSlack = .infinity
+			c.missed = false
+		}
+		clock = c
+		// Added latency vs the non-generating path (which shows at its target + half a refresh on average).
+		addedLatency = (displayTime(o) - i.grid) - (i.pacerDelay + c.refresh / 2)
+	}
+
+	private func noteGenSlack(_ slack: Double) {
+		guard var c = clock else { return }
+		if slack < 0 { c.missed = true } else { c.minSlack = min(c.minSlack, slack) }
+		clock = c
+	}
+
+	private func appendReal(_ i: Input, index: Int) {
+		var e = GeneratedEmit(buffer: i.buffer, arrival: i.arrival, target: i.target, interval: i.interval, kind: .real, sourceIndex: index)
+		if let c = clock {
+			let t = displayTime(slotIndex(i.grid))
+			e.target = t
+			e.interval = c.slotDur
+			e.presentAt = t - c.refresh / 2 // first vsync at/after this is exactly the slot's vsync
+		}
+		slots.append(Slot(isGen: false, emit: e, target: e.target, interval: e.interval, index: index))
+	}
+
+	/// An in-between slot at output slot `o` (slot clock required).
+	private func appendGen(prev: Picture, fallback: Input?, slot o: Int, index: Int) {
+		guard let c = clock else {
+			if let f = fallback { appendReal(f, index: index) }
+			return
+		}
+		let t = displayTime(o)
+		let slot = Slot(isGen: true, emit: nil, target: t, interval: c.slotDur, index: index)
 		slot.prev = prev
 		slot.fallback = fallback
+		slot.presentAt = t - c.refresh / 2
 		slots.append(slot)
-		// Deadline: the in-between picture must reach the renderer ~3 ms before its target.
-		let wait = slot.target - 0.003 - CACurrentMediaTime()
+		// Deadline: in the renderer `commitMargin` before the slot's vsync, else the fallback takes the slot.
+		let wait = t - commitMargin - CACurrentMediaTime()
 		queue.asyncAfter(deadline: .now() + max(0, wait)) { [weak self, weak slot] in
 			guard let self, let slot, !slot.done else { return }
+			self.noteGenSlack(-1)
 			self.fallBack(slot)
 			self.drain()
 		}
@@ -303,7 +431,7 @@ final class FrameGenerator {
 		slot.done = true
 		fallbacks += 1
 		if let r = slot.fallback {
-			slot.emit = GeneratedEmit(buffer: r.buffer, arrival: r.arrival, target: slot.target, interval: slot.interval, kind: .fallbackRepeat, sourceIndex: slot.index)
+			slot.emit = GeneratedEmit(buffer: r.buffer, arrival: r.arrival, target: slot.target, interval: slot.interval, kind: .fallbackRepeat, sourceIndex: slot.index, presentAt: slot.presentAt)
 		}
 		publish()
 	}
@@ -350,12 +478,17 @@ final class FrameGenerator {
 		case .off:
 			cadence = .native
 		case .to60, .to120:
-			if lowStream && maxRun == 0 {
+			let allNewRecently = history.count >= 12 && history.suffix(12).allSatisfy { $0 }
+			if lowStream {
+				// A genuine 30 fps (or lower) stream: always the same path. Repeats in it are static
+				// content, and interpolating two identical pictures is harmless (and costs nothing extra).
 				cadence = .doubling
 			} else if isolated >= 4 && maxRun <= 1 {
 				cadence = .fillRepeats // ~30-59 fps content in a 60 fps stream
-			} else if previous == .fillRepeats && maxRun <= 1 && isolated >= 2 {
-				cadence = .fillRepeats // hysteresis
+			} else if previous == .fillRepeats && !allNewRecently {
+				// Stay until 12 new pictures in a row (true 60 fps content). A static picture (all repeats)
+				// keeps the path, so pauses and menus don't toggle the latency.
+				cadence = .fillRepeats
 			} else if mode == .to120 && maxRun == 0 && history.suffix(12).allSatisfy({ $0 }) {
 				cadence = .doubling // 60 fps content -> 120
 			} else {
@@ -429,6 +562,8 @@ final class FrameGenerator {
 			                                          CVPixelBufferGetWidthOfPlane(b, plane), CVPixelBufferGetHeightOfPlane(b, plane), plane, &t)
 			return t
 		}
+		let t0 = CACurrentMediaTime()
+		defer { convertMs = (CACurrentMediaTime() - t0) * 1000 }
 		guard let sy = tex(pb, 0, .r16Unorm), let sc = tex(pb, 1, .rg16Unorm), let dy = tex(o, 0, .r8Unorm), let dc = tex(o, 1, .rg8Unorm),
 		      let cmd = commandQueue.makeCommandBuffer() else { return nil }
 		// Fixed dither pattern: a static pixel dithers identically in every frame, so the
@@ -457,6 +592,8 @@ final class FrameGenerator {
 	/// ones, which drag static overlays along with the motion behind them. Returns a new buffer.
 	private func protectStatic(prev: CVPixelBuffer, next: CVPixelBuffer, interp: CVPixelBuffer) -> CVPixelBuffer {
 		guard staticGuard, let poolOut else { return interp }
+		let t0 = CACurrentMediaTime()
+		defer { guardMs = (CACurrentMediaTime() - t0) * 1000 }
 		var out: CVPixelBuffer?
 		guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, poolOut, &out) == kCVReturnSuccess, let o = out,
 		      let cmd = commandQueue.makeCommandBuffer() else { return interp }
@@ -560,7 +697,8 @@ final class FrameGenerator {
 					} else {
 						let out = self.protectStatic(prev: prev, next: cur, interp: d)
 						slot.emit = GeneratedEmit(buffer: out, arrival: slot.next?.input.arrival ?? 0, target: slot.target,
-						                          interval: slot.interval, kind: .generated, sourceIndex: slot.index)
+						                          interval: slot.interval, kind: .generated, sourceIndex: slot.index, presentAt: slot.presentAt)
+						self.noteGenSlack(slot.target - self.commitMargin - CACurrentMediaTime())
 						slot.done = true
 						self.generated += 1
 						self.genWindowCount += 1
@@ -574,6 +712,7 @@ final class FrameGenerator {
 	}
 
 	private var lastPublish = 0.0
+	private var stoppedState = false
 
 	private func publish() {
 		let now = CACurrentMediaTime()
@@ -585,10 +724,15 @@ final class FrameGenerator {
 			genWindowStart = now
 			genWindowCount = 0
 		}
-		let (m, c, cf, g, fb, cut, extra) = (mode, cadence, contentFPS, generated, fallbacks, cutsSkipped, extraDelay)
+		let (m, c, cf, g, fb, cut, extra) = (mode, cadence, contentFPS, generated, fallbacks, cutsSkipped, addedLatency)
+		let (shifts, late, conv, grd, stopped) = (slotShifts, lateReal, convertMs, guardMs, stoppedState)
 		stats.update { s in
 			s.frameGeneration = m
-			s.frameGenerationState = c.rawValue
+			s.frameGenerationState = stopped ? "stopped" : c.rawValue
+			s.frameGenerationSlotShifts = shifts
+			s.frameGenerationLateReal = late
+			s.frameGenerationConvertMs = conv
+			s.frameGenerationGuardMs = grd
 			s.contentFPS = cf
 			s.framesGenerated = g
 			s.frameGenerationFallbacks = fb
@@ -626,6 +770,65 @@ final class FrameGenerator {
 		}
 		return result
 	}
+
+	/// Diagnostics: interpolate at reduced resolution (w x h), scaled back to full size, to judge the
+	/// quality / time trade-off. Returns the full-size picture and the total time (scale + interpolate +
+	/// scale back) in ms.
+	func interpolateScaledNow(prev: CVPixelBuffer, next: CVPixelBuffer, width w: Int, height h: Int) -> (CVPixelBuffer, Double)? {
+		var out: (CVPixelBuffer, Double)?
+		queue.sync {
+			guard let p8 = to8bit(prev), let n8 = to8bit(next) else { return }
+			if scaledProcessor == nil || scaledSize != (w, h) {
+				guard let cfg = VTLowLatencyFrameInterpolationConfiguration(frameWidth: w, frameHeight: h, numberOfInterpolatedFrames: 1) else { return }
+				let p = VTFrameProcessor()
+				do { try p.startSession(configuration: cfg) } catch { NSLog("[PSVideo] scaled interpolation session: %@", "\(error)"); return }
+				scaledSrcAttrs = cfg.sourcePixelBufferAttributes
+				scaledDstAttrs = cfg.destinationPixelBufferAttributes
+				scaledProcessor = p
+				scaledSize = (w, h)
+				var ts: VTPixelTransferSession?
+				VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &ts)
+				transfer = ts
+			}
+			guard let proc = scaledProcessor, let transfer else { return }
+			func make(_ ww: Int, _ hh: Int, _ base: [String: Any] = [:]) -> CVPixelBuffer? {
+				var a = base
+				a[kCVPixelBufferIOSurfacePropertiesKey as String] = [String: Any]()
+				a[kCVPixelBufferMetalCompatibilityKey as String] = true
+				var b: CVPixelBuffer?
+				CVPixelBufferCreate(kCFAllocatorDefault, ww, hh, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, a as CFDictionary, &b)
+				return b
+			}
+			guard let sp = make(w, h, scaledSrcAttrs), let sn = make(w, h, scaledSrcAttrs), let sd = make(w, h, scaledDstAttrs),
+			      let full = make(CVPixelBufferGetWidth(next), CVPixelBufferGetHeight(next)) else { return }
+			let t0 = CACurrentMediaTime()
+			VTPixelTransferSessionTransferImage(transfer, from: p8, to: sp)
+			VTPixelTransferSessionTransferImage(transfer, from: n8, to: sn)
+			guard let a = VTFrameProcessorFrame(buffer: sp, presentationTimeStamp: CMTime(value: 0, timescale: 120)),
+			      let b = VTFrameProcessorFrame(buffer: sn, presentationTimeStamp: CMTime(value: 2, timescale: 120)),
+			      let o = VTFrameProcessorFrame(buffer: sd, presentationTimeStamp: CMTime(value: 1, timescale: 120)),
+			      let params = VTLowLatencyFrameInterpolationParameters(sourceFrame: b, previousFrame: a, interpolationPhase: [0.5], destinationFrames: [o])
+			else { return }
+			let sem = DispatchSemaphore(value: 0)
+			var ok = false
+			proc.process(parameters: params) { _, e in
+				ok = e == nil
+				if let e { NSLog("[PSVideo] scaled interpolation failed: %@", "\(e)") }
+				sem.signal()
+			}
+			sem.wait()
+			guard ok else { return }
+			VTPixelTransferSessionTransferImage(transfer, from: sd, to: full)
+			CVBufferPropagateAttachments(next, full)
+			out = (protectStatic(prev: p8, next: n8, interp: full), (CACurrentMediaTime() - t0) * 1000)
+		}
+		return out
+	}
+	private var scaledProcessor: VTFrameProcessor?
+	private var scaledSize = (0, 0)
+	private var scaledSrcAttrs: [String: Any] = [:]
+	private var scaledDstAttrs: [String: Any] = [:]
+	private var transfer: VTPixelTransferSession?
 
 	/// Diagnostics: the analysis numbers for two pictures.
 	func analyzeNow(_ pb: CVPixelBuffer, previous: CVPixelBuffer?) -> (changed: Float, hist: [Float]) {

@@ -45,7 +45,15 @@ struct SettingsView: View {
 					Text("30 fps games to 60").tag(1)
 					Text("60 to 120 (experimental)").tag(2)
 				}
-				Text("Both apply immediately and switch to the Metal renderer. Frame generation adds about 30 ms of delay while it is filling in frames and none when the game already runs at 60.")
+				if settings.frameGeneration != 0 {
+					LabeledContent("Frame generation delay limit") {
+						HStack(spacing: 8) {
+							Slider(value: settings.$frameGenerationMaxDelay, in: 20...60, step: 2)
+							Text("\(Int(settings.frameGenerationMaxDelay)) ms").monospacedDigit().frame(width: 48, alignment: .trailing)
+						}
+					}
+				}
+				Text("Both apply immediately and switch to the Metal renderer. Frame generation needs about 30 ms of extra delay while it is filling in frames (none when the game already runs at 60); a lower limit is more responsive but shows plain frames more often.")
 					.font(.caption)
 					.foregroundStyle(.secondary)
 				Toggle("Low-latency renderer", isOn: settings.$lowLatencyRenderer)

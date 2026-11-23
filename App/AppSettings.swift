@@ -38,6 +38,8 @@ final class AppSettings: ObservableObject {
 	@AppStorage("stream.upscaler") var upscaler: Int = 0
 	/// 0 off, 1 fill 30 fps games up to 60, 2 double to 120 (experimental). Needs the Metal renderer and pacing; applies live.
 	@AppStorage("stream.frameGeneration") var frameGeneration: Int = 0
+	/// Most extra delay (ms) frame generation may add. Lower is more responsive but falls back to plain frames more often. Applies live.
+	@AppStorage("stream.frameGenerationMaxDelay") var frameGenerationMaxDelay: Double = 40
 	/// Experimental start-bitrate hint: 0 off, 1 variant A, 2 variant B. Applies to the next connection.
 	@AppStorage("stream.startBitrateHint") var startBitrateHint: Int = 0
 	@AppStorage("stream.showStats") var showStats: Bool = false

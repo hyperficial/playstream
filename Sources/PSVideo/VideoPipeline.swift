@@ -67,6 +67,25 @@ public final class VideoPipeline: VideoStreamSink {
 		}
 	}
 	private var frameGenerationSetting: VideoFrameGeneration = .off
+
+	/// Latency-versus-smoothness control for frame generation: the most extra delay (ms) the generator
+	/// may add over the non-generating paced path. Default 40. 30 -> 60 needs about half a content
+	/// interval (16.7 ms) + interpolation time (~10-15 ms) + jitter; below that, more in-between pictures
+	/// miss their slot and the repeat is shown instead (`stats.frameGenerationFallbacks` rises).
+	/// Main thread.
+	public var frameGenerationMaxAddedLatencyMs: Double = 40 {
+		didSet {
+			dispatchPrecondition(condition: .onQueue(.main))
+			frameGenerationMaxAddedLatencyMs = max(0, frameGenerationMaxAddedLatencyMs)
+			(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.setMaxAddedLatency(frameGenerationMaxAddedLatencyMs / 1000)
+			collector.update { $0.frameGenerationMaxAddedLatencyMs = self.frameGenerationMaxAddedLatencyMs }
+		}
+	}
+
+	/// Display vsync from the hosting view's display link (main thread).
+	func vsyncTick(timestamp: Double, period: Double) {
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.setVsync(timestamp: timestamp, period: period)
+	}
 	private var contentPixelSize: CGSize = .zero
 
 	/// Live statistics; cheap value copy, safe from any thread.
@@ -390,6 +409,7 @@ public final class VideoPipeline: VideoStreamSink {
 		let new = Self.makeRenderer(mode, stats: collector)
 		new.setPacing(pacingMode)
 		new.setUpscaler(upscalerSetting)
+		(new as? MetalVideoRenderer)?.setMaxAddedLatency(frameGenerationMaxAddedLatencyMs / 1000)
 		new.setFrameGeneration(frameGenerationSetting)
 		new.setOutputPixelSize(contentPixelSize)
 		if let o = outputOverride, let m = new as? MetalVideoRenderer { m.setOutputOverride(o) }
@@ -454,6 +474,12 @@ public final class VideoPipeline: VideoStreamSink {
 	@_spi(Diagnostics)
 	public func interpolateOffscreen(prev: CVPixelBuffer, next: CVPixelBuffer) -> (CVPixelBuffer, Double)? {
 		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.interpolateNow(prev: prev, next: next)
+	}
+
+	/// Diagnostics: interpolation at reduced resolution (scaled back to full size).
+	@_spi(Diagnostics)
+	public func interpolateScaledOffscreen(prev: CVPixelBuffer, next: CVPixelBuffer, width: Int, height: Int) -> (CVPixelBuffer, Double)? {
+		(rendererLock.withLock { renderer } as? MetalVideoRenderer)?.interpolateScaledNow(prev: prev, next: next, width: width, height: height)
 	}
 
 	/// Diagnostics: frame generation's picture analysis (changed-pixel fraction, luma histogram).

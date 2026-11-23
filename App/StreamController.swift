@@ -58,6 +58,7 @@ final class StreamController: ObservableObject {
 		self.video = VideoPipeline(displayMode: wanted.display, pacingMode: wanted.pacing)
 		self.video.upscaler = wanted.upscaler
 		self.video.frameGeneration = wanted.frameGeneration
+		self.video.frameGenerationMaxAddedLatencyMs = settings.frameGenerationMaxDelay
 		// Adaptive jitter buffer: 40 ms on a clean link, growing by itself when the link stalls.
 		self.audio = AudioPipeline(configuration: AudioPipelineConfiguration())
 	}
@@ -137,6 +138,10 @@ final class StreamController: ObservableObject {
 			video.frameGeneration = wanted.frameGeneration
 			changes.append("frame generation \(wanted.frameGeneration.rawValue)")
 		}
+		if video.frameGenerationMaxAddedLatencyMs != settings.frameGenerationMaxDelay {
+			video.frameGenerationMaxAddedLatencyMs = settings.frameGenerationMaxDelay
+			changes.append("frame generation budget \(Int(settings.frameGenerationMaxDelay)) ms")
+		}
 		if !changes.isEmpty { CoreLog.note("Video settings changed: " + changes.joined(separator: ", ")) }
 	}
 
@@ -185,11 +190,11 @@ final class StreamController: ObservableObject {
 			// Second line: what actually happened at the display, the only on-screen evidence we get.
 			CoreLog.note(
 				"Present: drops kf \(v.dropsAwaitingKeyframe) dec \(v.dropsDecodeError) superseded \(v.dropsSuperseded) overflow \(v.dropsQueueOverflow) nodrawable \(v.dropsNoDrawable)"
-					+ " | ontime \(v.presentsOnTime) late1 \(v.presentsLate1) late2+ \(v.presentsLate2Plus) notshown \(v.presentsNotShown) err \(ms(v.presentErrorAvgMs))/\(ms(v.presentErrorMaxMs)) ms commitahead \(ms(v.commitAheadMinMs)) ms"
+					+ " | ontime \(v.presentsOnTime) late1 \(v.presentsLate1) late2+ \(v.presentsLate2Plus) lategen \(v.presentsLateGenerated) notshown \(v.presentsNotShown) err \(ms(v.presentErrorAvgMs))/\(ms(v.presentErrorMaxMs)) ms commitahead \(ms(v.commitAheadMinMs)) ms"
 					+ " | refreshes \(v.presentedRefreshHistogram) offcadence \(v.presentedOffCadence) panel \(ms(v.displayRefreshHz)) Hz"
 					+ " | queue \(v.pacedQueueDepthMax) drawablewait \(ms(v.drawableWaitMaxMs)) ms glass \(ms(v.glassAvgMs)) ms"
 					+ " | upscaler \(v.activeUpscaler.rawValue) \(v.upscaleOutputWidth)x\(v.upscaleOutputHeight) gpu \(ms(v.renderGPUTimeAvgMs))/\(ms(v.renderGPUTimeMaxMs)) ms scaler \(ms(v.scalerGPUTimeAvgMs)) ms"
-					+ " | framegen \(v.frameGeneration.rawValue) state \(v.frameGenerationState) content \(String(format: "%.0f", v.contentFPS)) fps generated \(String(format: "%.0f", v.generatedFPS))/s total \(v.framesGenerated) fallbacks \(v.frameGenerationFallbacks) cuts \(v.frameGenerationCutsSkipped) hold \(ms(v.frameGenerationAddedLatencyMs)) ms time \(ms(v.frameGenerationTimeMs)) ms"
+					+ " | framegen \(v.frameGeneration.rawValue) state \(v.frameGenerationState) content \(String(format: "%.0f", v.contentFPS)) fps generated \(String(format: "%.0f", v.generatedFPS))/s total \(v.framesGenerated) fallbacks \(v.frameGenerationFallbacks) cuts \(v.frameGenerationCutsSkipped) hold \(ms(v.frameGenerationAddedLatencyMs))/\(ms(v.frameGenerationMaxAddedLatencyMs)) ms time \(ms(v.frameGenerationTimeMs)) ms convert \(ms(v.frameGenerationConvertMs)) ms guard \(ms(v.frameGenerationGuardMs)) ms slotshifts \(v.frameGenerationSlotShifts) latereal \(v.frameGenerationLateReal)"
 			)
 		}
 		CoreLog.note(String(

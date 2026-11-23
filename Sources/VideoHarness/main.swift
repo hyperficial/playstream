@@ -353,7 +353,7 @@ final class ArrivalModel {
 	init(seed: UInt64, interval: Double) {
 		rng = SplitMix(state: seed)
 		self.interval = interval
-		if opt.pattern == "stall" || opt.pattern == "mixed" {
+		if opt.pattern == "stall" || opt.pattern == "mixed" || opt.pattern == "live" {
 			var t = opt.pattern == "mixed" ? opt.mixedFrom : 0.4
 			let end = opt.pattern == "mixed" ? opt.mixedTo : opt.seconds + 1
 			while t < end {
@@ -369,7 +369,7 @@ final class ArrivalModel {
 	func arrival(_ i: Int) -> Double {
 		let ideal = Double(i) * interval
 		var t = ideal + uniform(0, 0.0003)
-		if opt.pattern == "jitter" { t += uniform(0, opt.jitterMs / 1000) }
+		if opt.pattern == "jitter" || opt.pattern == "live" { t += uniform(0, opt.jitterMs / 1000) }
 		if let s = stalls.first(where: { ideal >= $0.start && ideal < $0.end }) {
 			t = max(t, s.end) // held by the stalled radio, then delivered in one burst
 		}
@@ -592,7 +592,7 @@ func describePacing(_ s: VideoStats) -> String {
 	if let g = s.renderGPUTimeAvgMs, let m = s.renderGPUTimeMaxMs { t += String(format: " gpu=%.2f/%.2fms", g, m) }
 	if let g = s.scalerGPUTimeAvgMs { t += String(format: " mfx=%.2fms", g) }
 	if s.frameGeneration != .off {
-		t += String(format: " fg=%@/%@ content=%.0ffps gen=%.0f/s total=%d fallbacks=%d cuts=%d hold=%.1fms interp=%.1fms", s.frameGeneration.rawValue, s.frameGenerationState, s.contentFPS, s.generatedFPS, s.framesGenerated, s.frameGenerationFallbacks, s.frameGenerationCutsSkipped, s.frameGenerationAddedLatencyMs, s.frameGenerationTimeMs)
+		t += String(format: " fg=%@/%@ content=%.0ffps gen=%.0f/s total=%d fallbacks=%d cuts=%d added=%.1fms interp=%.1fms convert=%.2fms guard=%.2fms shifts=%d lateReal=%d lateGen=%d", s.frameGeneration.rawValue, s.frameGenerationState, s.contentFPS, s.generatedFPS, s.framesGenerated, s.frameGenerationFallbacks, s.frameGenerationCutsSkipped, s.frameGenerationAddedLatencyMs, s.frameGenerationTimeMs, s.frameGenerationConvertMs, s.frameGenerationGuardMs, s.frameGenerationSlotShifts, s.frameGenerationLateReal, s.presentsLateGenerated)
 	}
 	t += String(format: " lead=%.1fms", s.presentationLeadMs)
 	t += " drops[kf=\(s.dropsAwaitingKeyframe) dec=\(s.dropsDecodeError) sup=\(s.dropsSuperseded) ovf=\(s.dropsQueueOverflow) nodrw=\(s.dropsNoDrawable)]"

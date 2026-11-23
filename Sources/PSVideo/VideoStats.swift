@@ -127,6 +127,16 @@ public struct VideoStats: Sendable, Equatable {
 	public var frameGenerationAddedLatencyMs: Double = 0
 	/// Last interpolation call (VideoToolbox low-latency frame interpolation), ms.
 	public var frameGenerationTimeMs: Double = 0
+	/// Last 10 -> 8-bit conversion (HDR only) and static-overlay guard, ms (both on the critical path).
+	public var frameGenerationConvertMs: Double = 0
+	public var frameGenerationGuardMs: Double = 0
+	/// Times the slot grid moved by whole slots (later after a real picture would have missed its slot,
+	/// earlier after 6 s of spare time). Each one is a single visible hitch.
+	public var frameGenerationSlotShifts: Int = 0
+	/// Real pictures that arrived too late for their slot (the grid moved later).
+	public var frameGenerationLateReal: Int = 0
+	/// Most extra delay the generator may add over the non-generating paced path, ms (setting).
+	public var frameGenerationMaxAddedLatencyMs: Double = 40
 
 	// MARK: On-screen cadence (Metal path, from the drawables' presented times; nil on the layer path)
 
@@ -149,6 +159,8 @@ public struct VideoStats: Sendable, Equatable {
 	public var presentsLate1: Int = 0
 	/// Two or more refreshes later than requested.
 	public var presentsLate2Plus: Int = 0
+	/// Of the late ones (1 or 2+), how many were generated pictures.
+	public var presentsLateGenerated: Int = 0
 	/// Handed to the compositor but never shown (reported presentedTime 0, e.g. replaced in the same vsync).
 	public var presentsNotShown: Int = 0
 	/// actual - requested presentation time, ms, last second (avg / max).
@@ -311,10 +323,11 @@ final class StatsCollector: @unchecked Sendable {
 	}
 
 	/// A paced frame reached the glass `errorMs` after its requested time.
-	func presentTiming(errorMs: Double, refresh: Double) {
+	func presentTiming(errorMs: Double, refresh: Double, generated: Bool = false) {
 		lock.withLock { s in
 			let r = errorMs / 1000 / refresh
 			if r < 1 { s.stats.presentsOnTime += 1 } else if r < 2 { s.stats.presentsLate1 += 1 } else { s.stats.presentsLate2Plus += 1 }
+			if r >= 1 && generated { s.stats.presentsLateGenerated += 1 }
 			s.window.errSum += errorMs
 			s.window.errN += 1
 			s.window.errMax = max(s.window.errMax, errorMs)
